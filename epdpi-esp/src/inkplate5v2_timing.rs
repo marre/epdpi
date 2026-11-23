@@ -11,6 +11,7 @@
 
 /// The four panel controls involved in frame and row scan sequencing.
 /// CKV, SPH and LE are ESP32 direct GPIO; SPV is on PCAL6416A Port 0.
+#[allow(async_fn_in_trait)]
 #[maybe_async_cfg::maybe(
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)

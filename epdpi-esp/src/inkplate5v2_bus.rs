@@ -431,9 +431,9 @@ mod tests {
                     Operation::Read(b) => for byte in b.iter_mut() {
                         *byte = if addr == 0x20 && register < 8 {
                             self.regs0[usize::from(register)]
-                        } else if addr == 0x48 && register == 0x0f {
-                            0 // all rails off in diagnostics
-                        } else { 0 };
+                        } else {
+                            0 // PMIC PGOOD=0; unmodeled registers read zero.
+                        };
                         register += 1;
                     },
                 }

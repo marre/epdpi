@@ -1,0 +1,55 @@
+name: Inkplate 5 Gen 2 (read-only diagnostic firmware)
+
+on:
+  push:
+    branches:
+      - 'integration/**'
+    paths:
+      - 'firmware/inkplate5v2-diagnostic/**'
+      - '.github/workflows/inkplate5v2-diagnostic.yml'
+  pull_request:
+    paths:
+      - 'firmware/inkplate5v2-diagnostic/**'
+      - '.github/workflows/inkplate5v2-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    name: Build classic ESP32 read-only diagnostics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Xtensa ESP32 Rust
+        uses: esp-rs/xtensa-toolchain@v1.5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware/inkplate5v2-diagnostic
+      - name: Build diagnostic ELF
+        run: |
+          cargo build --manifest-path firmware/inkplate5v2-diagnostic/Cargo.toml \
+            --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+      - name: Convert to merged ESP32 image
+        run: |
+          cargo install espflash --locked --version 4.0.1
+          mkdir -p dist
+          espflash save-image --chip esp32 --merge \
+            firmware/inkplate5v2-diagnostic/target/xtensa-esp32-none-elf/release/inkplate5v2-diagnostic \
+            dist/inkplate5v2-diagnostic-merged.bin
+          cp firmware/inkplate5v2-diagnostic/target/xtensa-esp32-none-elf/release/inkplate5v2-diagnostic \
+            dist/inkplate5v2-diagnostic.elf
+          sha256sum dist/* | tee dist/SHA256SUMS
+      - name: Upload diagnostic image (not yet flash-authorized)
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkplate5v2-diagnostic-UNVALIDATED
+          path: dist/
+          if-no-files-found: error

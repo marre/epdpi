@@ -1,0 +1,10 @@
+# The classic ESP32 uses the Espressif Xtensa Rust toolchain.
+# The CI job supplies the target explicitly to avoid affecting host builds.
+[target.xtensa-esp32-none-elf]
+rustflags = [
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+]
+
+[unstable]
+build-std = ["core", "alloc"]

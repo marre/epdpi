@@ -34,7 +34,7 @@ use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 
 use epdpi::EpdParallelBus;
 use crate::inkplate5v2_power::{ExpanderSnapshot, Inkplate5v2Power, PowerError, PowerState};
-use crate::inkplate5v2_timing::{self, Inkplate5v2Signals};
+use crate::inkplate5v2_timing::{self as timing, Inkplate5v2Signals};
 
 /// Bytes in one ED052TC4 row including Soldered's trailing clock bytes.
 pub const INKPLATE5V2_ROW_BYTES: usize = 336;

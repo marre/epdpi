@@ -21,6 +21,9 @@
 pub enum ColorMode {
     /// Black and white only.
     BlackWhite,
+    /// Eight gray levels. The framebuffer still stores 4 bits per pixel; the panel
+    /// waveform maps pairs of adjacent levels to one physical gray level.
+    Grayscale8,
     /// Sixteen gray levels, 4 bits per pixel in the framebuffer.
     #[default]
     Grayscale16,
@@ -30,8 +33,8 @@ pub enum ColorMode {
 ///
 /// Two bits per pixel go over the bus, four pixels per byte, first pixel in bits 7:6.
 ///
-/// The enum is `#[non_exhaustive]`: the two bits have a fourth value that no panel here uses, so a
-/// `match` outside the crate needs a wildcard arm and a code added later does not break it:
+/// The enum is `#[non_exhaustive]`: a `match` outside the crate needs a wildcard arm, so
+/// future source-driver codes can be added without breaking callers:
 ///
 /// ```
 /// use epdpi::DriveCode;
@@ -67,6 +70,9 @@ pub enum DriveCode {
     Darken = 1,
     /// Push the pixel towards white.
     Lighten = 2,
+    /// The fourth source-driver code, used by some panels for a final idle pass.
+    /// It is distinct from `Hold` on the wire; the physical effect is panel-specific.
+    Skip = 3,
 }
 
 /// Static physical facts about one raw-parallel panel, held by a zero-sized type.
@@ -97,6 +103,18 @@ pub trait EpdPanel {
 
     /// Bytes per bus scanline including trailing dummy clocks.
     const SCANLINE_BYTES: usize = Self::SCANLINE_PIXEL_BYTES + Self::LINE_PADDING;
+
+    /// Full-screen cleaning pattern. Every `(code, passes)` pair sends the uniform drive
+    /// code over the whole panel for that many frames, in the given order.
+    /// The default preserves the ED047TC1 cleaning behavior. A different panel can
+    /// override this without changing the generic refresh engine.
+    const CLEAR_SEQUENCE: &'static [(DriveCode, usize)] = &[
+        (DriveCode::Darken, crate::waveform::CLEAR_PASSES),
+        (DriveCode::Lighten, crate::waveform::CLEAR_PASSES),
+    ];
+
+    /// Drive code for the final idle frame after refresh or clear.
+    const POST_REFRESH_CODE: DriveCode = DriveCode::Hold;
 
     /// Waveform matrix, `16 * PASSES` bytes. Row `g` (gray level `g`, 0 black to 15 white)
     /// holds one [`DriveCode`] per pass.

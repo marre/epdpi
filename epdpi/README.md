@@ -10,6 +10,21 @@ which covers SPI panels that have their own controller IC.
 | Panel | Resolution | Grays | Boards |
 | :--- | :--- | :--- | :--- |
 | `Ed047tc1` | 960 x 540 | 16 | M5Stack PaperDIY, LilyGo T5 4.7 S3 V2.4 |
+| `Ed052tc4` | 1280 x 720 | 8 | Soldered Inkplate 5 Gen 2 (panel data only) |
+
+## Inkplate 5 Gen 2 status
+
+The ED052TC4 panel definition uses Soldered's nine-pass grayscale waveform and 48-pass
+full-cleaning pattern. The existing 4-bpp `Gray4` framebuffer is retained: levels 0/1
+map to the darkest physical gray, 2/3 to the next, through 14/15 to white. Two framebuffers
+need 460,800 bytes **each**; the scanline buffer is 336 bytes including 16 trailing clocks.
+
+This is **panel data only**. It has not been verified on Inkplate hardware. The classic
+ESP32 I2S1 parallel transport, its byte ordering, GPIO expander, TPS65186 power sequencing,
+and timing need a separate board-specific implementation before any hardware refresh.
+The panel's factory VCOM calibration is not overridden. `Quality16` means the framework's
+full-cleaning grayscale mode; this panel renders eight physical levels. The M5GFX modes
+have no ED052TC4 waveform tables and should not be used with this panel.
 
 ## Status
 
@@ -54,8 +69,8 @@ On the ESP32-S3 put the two big ones in PSRAM.
 
 | Mode | What it does | Notes |
 | :--- | :--- | :--- |
-| `Clear` | 16 darken passes, 16 lighten passes, discharge | flashes |
-| `Quality16` | clear, then the 8-pass 16-gray waveform | flashes, several seconds |
+| `Clear` | panel-specific full-clean sequence, then an idle frame | flashes |
+| `Quality16` | panel-specific clear, then the waveform LUT | ED047TC1: 16 gray levels; ED052TC4: 8 gray levels |
 | `FastMono` | 4 passes, drives only pixels that changed, threshold at gray 8 | no full-screen flash, 379 ms |
 | `M5Quality` | M5GFX `epd_quality`: a short erase toward mid gray, then the 16-gray waveform for the target | no clear, needs the previous picture |
 | `M5Text` | M5GFX `epd_text`: the erase, then 12 passes, only for pixel pairs that are not white before and after | a page of text flashes less than `M5Quality` |

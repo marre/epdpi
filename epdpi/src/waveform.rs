@@ -52,14 +52,10 @@ pub enum RefreshMode {
     /// The threshold of 8 is a hard cut. FastEPD has no threshold in its update (its buffer is
     /// 1 bit per pixel) and the 8 does not come from it.
     FastMono,
-    /// Full 16-level update: clears the panel, then runs every pass of the panel's waveform
-    /// matrix. Flashes and takes several seconds.
-    ///
-    /// The clear is 16 darken passes then 16 lighten passes. FastEPD's slow clear has the same
-    /// 32 passes in four darken and lighten pairs of 8, and its `clearWhite` runs 7 + 7 and a
-    /// neutral pass. Unlike FastEPD, this mode goes from the last lighten pass straight into
-    /// pass 0 of the matrix (FastEPD runs a neutral pass between), and it waits no 230 us after
-    /// each pass.
+    /// Full grayscale update: cleans the panel with its [`EpdPanel::CLEAR_SEQUENCE`],
+    /// then runs every pass of the panel's waveform matrix. Flashes and takes several seconds.
+    /// The ED047TC1 default uses 16 darken then 16 lighten passes. The cleaning pattern is
+    /// panel-specific; the bus is responsible for any required inter-frame settle delays.
     Quality16,
     /// 16-level update that follows M5GFX `epd_quality`: a short erase that moves each pixel
     /// from the gray it holds now towards mid gray, then the quality waveform for its target
@@ -87,10 +83,8 @@ pub enum RefreshMode {
     M5Fast,
     /// M5GFX `epd_fastest`: like [`M5Fast`](Self::M5Fast) with `lut_fastest` (5 passes).
     M5Fastest,
-    /// Flashes the panel black then white and leaves it white.
-    ///
-    /// 16 darken passes then 16 lighten passes, deliberately stronger than FastEPD's
-    /// `clearWhite` (7 + 7 and a neutral pass) after ghosts survived 8 passes on a PaperDIY.
+    /// Cleans the panel with its [`EpdPanel::CLEAR_SEQUENCE`] and leaves it white.
+    /// The ED047TC1 default is 16 darken then 16 lighten passes followed by an idle pass.
     Clear,
 }
 
@@ -102,8 +96,8 @@ impl RefreshMode {
     }
 }
 
-/// Darken and lighten pulses in the clear cycle. 8 left faint ghosts of the smileys on a PaperDIY after
-/// 250 [`RefreshMode::FastMono`] frames and a second clear removed them; 16 in one cycle left a clean panel.
+/// Default darken and lighten pass count for ED047TC1. Eight passes left faint ghosts after
+/// 250 [`RefreshMode::FastMono`] frames on a PaperDIY; 16 left it clean.
 pub(crate) const CLEAR_PASSES: usize = 16;
 /// Passes in a [`RefreshMode::FastMono`] update.
 pub(crate) const MONO_PASSES: usize = 4;

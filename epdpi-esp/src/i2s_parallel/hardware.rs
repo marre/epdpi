@@ -7,7 +7,7 @@ use esp_hal::Blocking;
 use esp_hal::dma::{DmaError, DmaTxBuf};
 use esp_hal::i2s::parallel::I2sParallel;
 
-use super::{PackError, pack_i2s1_scanline};
+use super::{PackError, pack_i2s1_scanline, pack_inkplate5v2_scanline};
 
 #[cfg(feature = "blocking")]
 type Mode = Blocking;
@@ -68,6 +68,21 @@ impl Esp32I2sTx {
     /// after DMA has completed. For accurate pulse timing, account for
     /// startup and await overhead, then validate on a logic analyzer.
     pub async fn send_scanline(&mut self, line: &[u8]) -> Result<(), I2sTxError> {
+        self.send_with_packer(line, pack_i2s1_scanline).await
+    }
+
+    /// Send a 336-byte ED052TC4 row using the Soldered Inkplate 5V2 DMA
+    /// pixel ordering. This is a transmitter only, not a board power driver.
+    /// Do not call during physical bring-up before GPIO timing is verified.
+    pub async fn send_inkplate5v2_scanline(&mut self, line: &[u8]) -> Result<(), I2sTxError> {
+        self.send_with_packer(line, pack_inkplate5v2_scanline).await
+    }
+
+    async fn send_with_packer(
+        &mut self,
+        line: &[u8],
+        packer: fn(&[u8], &mut [u8]) -> Result<usize, PackError>,
+    ) -> Result<(), I2sTxError> {
         let Some(i2s) = self.i2s.take() else {
             return Err(I2sTxError::Lost);
         };
@@ -76,7 +91,7 @@ impl Esp32I2sTx {
             return Err(I2sTxError::Lost);
         };
 
-        let packed = pack_i2s1_scanline(line, buffer.as_mut_slice());
+        let packed = packer(line, buffer.as_mut_slice());
         let size = match packed {
             Ok(len) => len,
             Err(error) => {

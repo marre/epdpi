@@ -38,6 +38,8 @@ pub enum PackError {
     NotWordAligned,
     /// The supplied DMA buffer cannot fit the line.
     TooLong,
+    /// This board requires exactly 320 pixel bytes and 16 trailing clocks.
+    WrongInkplateScanlineLength,
 }
 
 /// Convert logical on-wire scanline bytes into classic ESP32 I2S1 DMA order.
@@ -62,6 +64,57 @@ pub fn pack_i2s1_scanline(input: &[u8], output: &mut [u8]) -> Result<usize, Pack
         dst.copy_from_slice(&[src[2], src[3], src[0], src[1]]);
     }
     Ok(input.len())
+}
+
+
+/// Pixels encoded in one byte of the ED052TC4 scanline use four 2-bit codes.
+/// The Soldered driver reads its framebuffer from right to left, including
+/// within each pixel pair. This flips their order without changing the code.
+const fn reverse_drive_codes(value: u8) -> u8 {
+    ((value & 0x03) << 6)
+        | ((value & 0x0c) << 2)
+        | ((value & 0x30) >> 2)
+        | ((value & 0xc0) >> 6)
+}
+
+/// Convert an ED052TC4 *logical* left-to-right scanline to Soldered's
+/// Inkplate 5 Gen 2 I2S1 DMA byte layout.
+///
+/// Exactly 320 drive-code bytes encode 1280 pixels; 16 trailing bytes clock
+/// through the row without representing pixels. Soldered's `display3b()`
+/// reads pixel data backwards, swaps the pixels within each pair through
+/// `GLUT`, and stores each four-byte DMA group at offsets 2,3,0,1.
+/// This helper reproduces that layout from the core crate's forward scanline.
+/// It does **not** change the reusable `pack_i2s1_scanline` format.
+///
+/// The resulting DMA layout is covered by an independently transcribed
+/// Soldered reference algorithm in host tests. Physical I2S FIFO/clock
+/// behavior (including `tx_right_first`) still requires a logic analyzer.
+pub fn pack_inkplate5v2_scanline(
+    logical: &[u8],
+    dma: &mut [u8],
+) -> Result<usize, PackError> {
+    const PIXEL_BYTES: usize = 320;
+    const ROW_BYTES: usize = 336;
+    if logical.len() != ROW_BYTES {
+        return Err(PackError::WrongInkplateScanlineLength);
+    }
+    if dma.len() < ROW_BYTES {
+        return Err(PackError::TooLong);
+    }
+
+    for i in 0..(PIXEL_BYTES / 4) {
+        let base = i * 4;
+        let src = PIXEL_BYTES - 1 - base;
+        // Peripheral emits each four-byte DMA group in [2,3,0,1] order
+        // under esp-hal 1.1. Match Soldered's source's [2,3,0,1] layout.
+        dma[base] = reverse_drive_codes(logical[src - 2]);
+        dma[base + 1] = reverse_drive_codes(logical[src - 3]);
+        dma[base + 2] = reverse_drive_codes(logical[src]);
+        dma[base + 3] = reverse_drive_codes(logical[src - 1]);
+    }
+    dma[PIXEL_BYTES..ROW_BYTES].copy_from_slice(&logical[PIXEL_BYTES..ROW_BYTES]);
+    Ok(ROW_BYTES)
 }
 
 #[cfg(feature = "esp32")]

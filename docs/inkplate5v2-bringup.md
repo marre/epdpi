@@ -10,9 +10,19 @@ two independent, upstream-oriented changes:
   DMA transmitter and four-byte packing/byte-order tests.
 
 The host integration test in `epdpi-esp/tests/inkplate5v2_pipeline_tests.rs`
-exercises the grayscale waveform through I2S1 word rearrangement and back
-to the simulated on-wire data. It does not prove physical pin order, bus
-timing or safe panel power.
+compares the **actual vendor DMA pixel layout** with an independently
+transcribed Soldered `display3b()` lookup-and-reversal algorithm for nine
+passes and a nonuniform row using every one of the eight grayscale shades.
+The `pack_inkplate5v2_scanline` helper reverses logical pixel order and
+performs the I2S1 word swizzle without changing the generic I2S packer.
+The hardware transmitter exposes `send_inkplate5v2_scanline` for a future
+board-specific bus.
+
+These comparisons prove software-equivalent DMA bytes, **not** physical
+clock and data ordering. The manufacturer's direct register driver uses
+`tx_right_first=0`, whereas esp-hal 1.1 configures `tx_right_first=1`.
+This discrepancy requires measuring the clock and data signals before
+any high-voltage display refresh.
 
 ## Hardware dependencies to implement here
 
@@ -21,8 +31,14 @@ timing or safe panel power.
    The controller follows Soldered's register ordering, gates OE/VCOM on
    PGOOD, has bounded waits and a fault latch. Host tests cover failure paths.
    **Not yet wired to real ESP32 GPIO or tested on physical rails.**
-2. Verify the PCAL6416A, PMIC and factory VCOM behavior on a physical
-   device with non-driving diagnostics. No VCOM EEPROM writes are used.
+2. The power controller now exposes `inspect_expander()` for read-only
+   PCAL6416A Port 0/1 output and direction registers. This includes Port 1
+   bit 0 (`GPIO0_ENABLE`). It does not drive the pins or wake the PMIC.
+   Initialization checks PGOOD before modifying the sequencer and shutdown
+   follows the manufacturer's WAKEUP-before-ENABLE=0 order. The clock-enable
+   signal itself is not yet driven.
+   Verify the PMIC and factory VCOM behavior on a physical device with
+   non-driving diagnostics. No VCOM EEPROM writes are used.
 3. A full `Inkplate5v2Bus: EpdParallelBus` composing the reusable ESP32
    I2S1 transport with direct GPIO and expander pins. Connect the
    board-specific gate/source start/end timing to scanline boundaries.

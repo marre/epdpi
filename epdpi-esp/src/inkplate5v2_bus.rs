@@ -363,3 +363,196 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    extern crate std;
+
+    use super::*;
+    use core::convert::Infallible;
+    use embedded_hal::digital::ErrorType as PinErrorType;
+    use embedded_hal::i2c::{ErrorType as I2cErrorType, Error as I2cError, ErrorKind, Operation};
+    use std::vec::Vec;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct BusFault;
+    impl I2cError for BusFault {
+        fn kind(&self) -> ErrorKind { ErrorKind::Other }
+    }
+
+    #[derive(Default)]
+    struct FakeI2c {
+        regs0: [u8; 8],
+        writes: Vec<(u8, u8, u8)>,
+    }
+    impl FakeI2c {
+        fn fresh() -> Self {
+            let mut x = Self::default();
+            // All 16 expander pins are inputs at power-on.
+            x.regs0[6] = 0xff;
+            x.regs0[7] = 0xff;
+            x.regs0[2] = 0xff;
+            x.regs0[3] = 0xff;
+            x
+        }
+    }
+    impl I2cErrorType for FakeI2c { type Error = BusFault; }
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    impl I2c for FakeI2c {
+        async fn transaction(
+            &mut self,
+            addr: u8,
+            operations: &mut [Operation<'_>],
+        ) -> Result<(), BusFault> {
+            let mut register = 0;
+            for op in operations {
+                match op {
+                    Operation::Write(b) => {
+                        if let Some((&first, values)) = b.split_first() {
+                            register = first;
+                            for &v in values {
+                                self.writes.push((addr, register, v));
+                                if addr == 0x20 && register < 8 {
+                                    self.regs0[usize::from(register)] = v;
+                                }
+                                register += 1;
+                            }
+                        }
+                    }
+                    Operation::Read(b) => for byte in b.iter_mut() {
+                        *byte = if addr == 0x20 && register < 8 {
+                            self.regs0[usize::from(register)]
+                        } else if addr == 0x48 && register == 0x0f {
+                            0 // all rails off in diagnostics
+                        } else { 0 };
+                        register += 1;
+                    },
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDelay;
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    impl DelayNs for FakeDelay {
+        async fn delay_ns(&mut self, _: u32) {}
+    }
+
+    #[derive(Default)]
+    struct FakePin {
+        writes: Vec<bool>,
+    }
+    impl PinErrorType for FakePin {
+        type Error = Infallible;
+    }
+    impl OutputPin for FakePin {
+        fn set_low(&mut self) -> Result<(), Infallible> {
+            self.writes.push(false);
+            Ok(())
+        }
+        fn set_high(&mut self) -> Result<(), Infallible> {
+            self.writes.push(true);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeTx {
+        transmissions: usize,
+    }
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    impl Inkplate5v2Dma for FakeTx {
+        type Error = Infallible;
+        async fn send_vendor_row(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            self.transmissions += 1;
+            Ok(())
+        }
+    }
+
+    fn bus() -> Inkplate5v2Bus<FakeTx, FakeI2c, FakeDelay, FakePin> {
+        Inkplate5v2Bus::new(
+            FakeTx::default(),
+            Inkplate5v2Power::new(FakeI2c::fresh(), FakeDelay),
+            Inkplate5v2DirectPins {
+                le: FakePin::default(),
+                ckv: FakePin::default(),
+                sph: FakePin::default(),
+            },
+        )
+    }
+
+    macro_rules! run_both {
+        ($name:ident, $body:ident) => {
+            #[test]
+            fn $name() {
+                #[cfg(feature = "blocking")]
+                { $body(); }
+                #[cfg(not(feature = "blocking"))]
+                { pollster::block_on($body()); }
+            }
+        };
+    }
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn read_only_diagnostics_are_non_driving_body() {
+        let mut b = bus();
+        let p = b.inspect().await.unwrap();
+        assert!(!p.clock_enabled());
+        let (tx, power, pins) = b.release();
+        let (i2c, _) = power.release();
+        assert!(i2c.writes.is_empty());
+        assert_eq!(tx.transmissions, 0);
+        assert!(pins.ckv.writes.is_empty());
+        assert!(pins.sph.writes.is_empty());
+        assert!(pins.le.writes.is_empty());
+    }
+    run_both!(read_only_diagnostics_are_non_driving, read_only_diagnostics_are_non_driving_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn hardware_refresh_is_locked_even_after_preparation_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        assert!(b.inspect().await.unwrap().clock_enabled());
+        assert!(matches!(
+            b.set_power(true).await,
+            Err(Inkplate5v2BusError::HardwareNotValidated)
+        ));
+        assert!(matches!(
+            b.start_frame().await,
+            Err(Inkplate5v2BusError::NotPowered)
+        ));
+        let (tx, power, pins) = b.release();
+        let (i2c, _) = power.release();
+        assert_eq!(tx.transmissions, 0);
+        assert_eq!(pins.ckv.writes, &[false]);
+        assert_eq!(pins.sph.writes, &[true]);
+        assert_eq!(pins.le.writes, &[false]);
+        assert!(!i2c.writes.iter().any(|&(addr, reg, value)|
+            addr == 0x48 && reg == 0x01 && value == 0x20
+        ));
+        assert_eq!(i2c.regs0[2] & 0x3f, 0);
+        assert_eq!(i2c.regs0[6] & 0x3f, 0);
+        assert_eq!(i2c.regs0[3] & 0x01, 1);
+        assert_eq!(i2c.regs0[7] & 0x01, 0);
+    }
+    run_both!(hardware_refresh_is_locked_even_after_preparation, hardware_refresh_is_locked_even_after_preparation_body);
+}

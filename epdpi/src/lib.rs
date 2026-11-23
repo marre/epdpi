@@ -2,8 +2,8 @@
 //!
 //! A `no_std`, [`embedded-hal`] 1.0 compatible driver framework for raw-parallel
 //! Electronic Paper Displays, where the MCU drives the panel's gate and source drivers
-//! directly over an 8-bit data bus and runs the waveform itself. The first supported
-//! glass is the E Ink ED047TC1 (960 x 540, 16 grays), on the M5Stack PaperDIY and the LilyGo T5 4.7 S3 V2.4.
+//! directly over an 8-bit data bus and runs the waveform itself. The supported
+//! glass includes E Ink ED047TC1 (960 x 540, 16 grays) and ED052TC4 (1280 x 720, 8 grays).
 //! It is the parallel counterpart of `epdsi`, which covers SPI panels with their own
 //! controller IC.
 //!
@@ -52,7 +52,8 @@ pub use crate::driver::{EpdDisplay, EpdDisplayBuilder};
 pub use crate::error::ValidationError;
 pub use crate::graphics::{EpdFrameBuffer, Rect, Rotation};
 pub use crate::panels::{
-    ED047TC1_LUT, Ed047tc1, M5_ERASER_LUT, M5_FAST_LUT, M5_FASTEST_LUT, M5_QUALITY_LUT, M5_TEXT_LUT,
+    ED047TC1_LUT, ED052TC4_LUT, Ed047tc1, Ed052tc4, M5_ERASER_LUT, M5_FAST_LUT, M5_FASTEST_LUT,
+    M5_QUALITY_LUT, M5_TEXT_LUT,
 };
 pub use crate::traits::{ColorMode, DriveCode, EpdPanel, EpdParallelBus};
 pub use crate::waveform::RefreshMode;

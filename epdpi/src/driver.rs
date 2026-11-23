@@ -5,7 +5,7 @@ use core::marker::PhantomData;
 use crate::error::ValidationError;
 use crate::graphics::{EpdFrameBuffer, Rect};
 use crate::traits::{DriveCode, EpdPanel, EpdParallelBus};
-use crate::waveform::{CLEAR_PASSES, M5Pass, RefreshMode, WaveformEngine};
+use crate::waveform::{M5Pass, RefreshMode, WaveformEngine};
 
 /// Builds an [`EpdDisplay`].
 #[derive(Debug)]
@@ -114,12 +114,18 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
         Ok(())
     }
 
-    /// Flashes black then white, leaving the panel white.
+    /// Runs the cleaning sequence configured for this panel.
+    async fn drive_clear_sequence(&mut self) -> Result<(), BUS::Error> {
+        for &(code, passes) in PANEL::CLEAR_SEQUENCE {
+            self.drive_uniform(code, passes).await?;
+        }
+        Ok(())
+    }
+
+    /// Cleans the glass and sends one final panel-specific idle frame.
     async fn clear_cycle(&mut self) -> Result<(), BUS::Error> {
-        self.drive_uniform(DriveCode::Darken, CLEAR_PASSES).await?;
-        self.drive_uniform(DriveCode::Lighten, CLEAR_PASSES).await?;
-        // Neutral pass puts the drivers into their discharge state.
-        self.drive_uniform(DriveCode::Hold, 1).await
+        self.drive_clear_sequence().await?;
+        self.drive_uniform(PANEL::POST_REFRESH_CODE, 1).await
     }
 
     /// Flashes the panel to a clean white and resets the record of what it shows.
@@ -239,8 +245,7 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
             return self.clear_cycle().await;
         }
         if mode == RefreshMode::Quality16 {
-            self.drive_uniform(DriveCode::Darken, CLEAR_PASSES).await?;
-            self.drive_uniform(DriveCode::Lighten, CLEAR_PASSES).await?;
+            self.drive_clear_sequence().await?;
         }
         let stride = PANEL::FB_STRIDE_BYTES;
         let rows = window.y as usize..(window.y + window.h) as usize;
@@ -309,7 +314,7 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
             }
             self.bus.end_frame().await?;
         }
-        self.drive_uniform(DriveCode::Hold, 1).await
+        self.drive_uniform(PANEL::POST_REFRESH_CODE, 1).await
     }
 }
 

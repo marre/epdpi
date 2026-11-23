@@ -1,3 +1,20 @@
+## First-stage read-only diagnostic firmware and recovery
+
+A separate classic ESP32 diagnostic application lives at
+`firmware/inkplate5v2-diagnostic/` and is built by
+`.github/workflows/inkplate5v2-diagnostic.yml`. It has **no dependency
+on `epdpi` or `epdpi-esp`**, and only initializes UART0 and I2C0.
+It reads PCAL6416A registers 0x00, 0x01, 0x02, 0x03, 0x06, 0x07,
+reporting P0.7 physical PWR_GOOD. It never accesses the TPS65186,
+sets PCAL GPIO outputs, configures I2S or requests display high voltage.
+
+**Do not flash this experimental image yet.** Before replacing firmware,
+validate a full flash backup and physical ROM-boot recovery following
+[Inkplate 5 Gen 2 backup/recovery](inkplate5v2-recovery.md).
+A valid Rust compilation and merged image do not prove that booting the
+firmware is safe for every board revision. The generated CI image is marked
+`UNVALIDATED`.
+
 # Inkplate 5 Gen 2 integrated bring-up
 
 This is the working integration branch for Soldered's Inkplate 5 Gen 2

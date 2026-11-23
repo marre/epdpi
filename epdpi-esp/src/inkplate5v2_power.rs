@@ -676,6 +676,7 @@ mod tests {
     async fn vcom_and_oe_wait_until_pgood_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
         power.enable().await.unwrap();
         assert_eq!(power.state(), PowerState::On);
         let (mut i2c, delay) = power.release();
@@ -706,6 +707,7 @@ mod tests {
     async fn powers_down_to_verified_zero_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
         power.enable().await.unwrap();
         power.disable().await.unwrap();
         assert_eq!(power.state(), PowerState::Idle);
@@ -751,6 +753,7 @@ mod tests {
         i2c.rails_ready = false;
         let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
         power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
         assert_eq!(
             power.enable().await,
             Err(PowerError::PowerGoodTimeout(0))
@@ -775,6 +778,7 @@ mod tests {
     async fn i2c_failure_attempts_shutdown_and_latches_fault_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
         power.i2c.fail_sequence_write_once = true;
         assert_eq!(power.enable().await, Err(PowerError::I2c(FakeError)));
         assert_eq!(power.state(), PowerState::Faulted);
@@ -794,6 +798,7 @@ mod tests {
     async fn pgood_i2c_failure_blocks_panel_drive_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
         power.i2c.fail_pgood_read_once = true;
         assert_eq!(power.enable().await, Err(PowerError::I2c(FakeError)));
         assert_eq!(power.state(), PowerState::Faulted);
@@ -810,6 +815,7 @@ mod tests {
     async fn discharge_timeout_latches_fault_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
         power.enable().await.unwrap();
         power.i2c.stuck_high_after_shutdown = true;
         assert_eq!(

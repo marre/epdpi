@@ -9,6 +9,7 @@ They exist because the 16-gray waveforms are built for M5GFX's row data phase of
 | `fast_bus::Esp32s3Bus` | about 62 us | no feature, writes the S3 GPIO registers |
 | `lcd_bus::LcdBus` | about 22 us measured | `esp32s3` feature, `esp-hal` 1.1 |
 | `shift_reg_bus::ShiftRegBus` | set by the row time, 22 us by default | `esp32s3` feature, `esp-hal` 1.1 |
+| `i2s_parallel::Esp32I2sTx` | depends on configured I2S1 clock; unmeasured | `esp32` feature, `esp-hal` 1.1 |
 
 The 6.5 us that `LcdBus` takes over the computed 15.5 us is the `send()` setup, which was not
 isolated. A whole `LcdBus` row takes about 117 us (computed, not measured here), against about
@@ -27,13 +28,26 @@ differ between boards. `ShiftRegBus` uses `shift_reg::ShiftReg`, which also runs
 
 ## Chips
 
-Only the ESP32-S3 exists and is tested, on an M5Stack PaperDIY and a LilyGo T5 4.7 S3 V2.4. The chip is a feature, as in
-`esp-hal`.
+The ESP32-S3 LCD_CAM buses are tested on the PaperDIY and LilyGo boards.
+Classic ESP32 I2S1 has a new **transport-only**, untested implementation behind the `esp32`
+feature. The chip is a Cargo feature, as in `esp-hal`.
 
 ```toml
 epdpi = "0.3"
 epdpi-esp = { version = "0.3", features = ["esp32s3"] }
 ```
+
+For classic ESP32 I2S1:
+
+```toml
+epdpi-esp = { version = "0.3", features = ["esp32"] }
+```
+
+The `i2s_parallel` module documents the HAL pin setup and scanline byte ordering.
+On Inkplate 5V2, I2S1 clocks the data pins but **does not control** SPH, CKV,
+SPV, LE, the PCAL6416A GPIO expander or the TPS65186 PMIC. A board-specific
+`EpdParallelBus` wrapper must sequence these safely. Do not enable the e-paper
+power rails until that implementation is tested.
 
 `epdpi-esp` depends on `esp-hal` 1.1 (with its `unstable` feature). Cargo allows one copy of
 `esp-hal`, so your project must use a compatible version.
@@ -51,6 +65,10 @@ its short waits, so the CPU is free between rows. On a PaperDIY an async refresh
 when rows are cheap to build.
 
 ## Status
+
+The classic ESP32 transmitter has unit tests for byte packing and error handling,
+but has not been compiled on the Xtensa target or tested against physical hardware
+as of this initial change. The ESP32 build CI should establish compile validation.
 
 `LcdBus` and `fast_bus` are tested on an M5Stack PaperDIY, in both modes. `ShiftRegBus` runs on a LilyGo T5 4.7 S3 V2.4, in both modes, with the examples of [`rust-lilygot5-47-s3-examples`](https://github.com/melastmohican/rust-lilygot5-47-s3-examples). See the `rust-m5paperdiy-examples` repository (`blocking/` and `async/`, the bus diagnostics are on its
 `bringup` branch) for tests of both buses.

@@ -3,13 +3,13 @@ name = "epdpi-esp"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "ESP32 parallel buses for the epdpi e-paper driver: LCD_CAM with DMA, register-level GPIO and a shift register bus (ESP32-S3, tested on M5Stack PaperDIY and LilyGo T5 4.7 S3)"
+description = "Raw-parallel e-paper transports for classic ESP32 I2S DMA and ESP32-S3 LCD_CAM DMA"
 license.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/epdpi-esp"
 readme = "README.md"
 homepage.workspace = true
-keywords = ["epd", "epaper", "esp32s3", "esp-hal", "embedded-hal"]
+keywords = ["epd", "epaper", "esp32", "esp-hal", "embedded-hal"]
 categories = ["embedded", "no-std", "hardware-support"]
 # esp-hal 1.1 needs Rust 1.88.
 rust-version = "1.88"
@@ -34,10 +34,12 @@ default = ["blocking"]
 # for the async API.
 blocking = ["epdpi/blocking"]
 defmt = ["dep:defmt", "epdpi/defmt"]
-# The ESP32-S3, the only chip so far. Pulls in `esp-hal` and enables `lcd_bus` and `shift_reg_bus`.
+# Classic ESP32 I2S1 8-bit parallel DMA transmitter.
+esp32 = ["dep:esp-hal", "esp-hal/esp32"]
+# ESP32-S3 LCD_CAM DMA buses.
 esp32s3 = ["dep:esp-hal", "esp-hal/esp32s3"]
 
-# docs.rs builds the default features on its Linux host. `esp32s3` needs the Xtensa target, so
+# docs.rs builds the default features on its Linux host. Chip features need Xtensa targets, so
 # `lcd_bus` and `shift_reg_bus` are prose-only pages there (see `docs/`). Never `all-features` here.
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

@@ -12,6 +12,7 @@
 //! | [`fast_bus::Esp32s3Bus`] | about 62 us | any ESP32-S3 HAL, no feature |
 //! | `lcd_bus::LcdBus` | about 22 us measured | `esp32s3` feature, `esp-hal`. Blocking and async |
 //! | `shift_reg_bus::ShiftRegBus` | set by the row time, 22 us by default | `esp32s3` feature, `esp-hal`. Blocking and async |
+//! | `i2s_parallel::Esp32I2sTx` | depends on requested clock, not measured | `esp32` feature, `esp-hal`. Blocking and async |
 //!
 //! The 6.5 us that `LcdBus` takes over the computed 15.5 us is the `send()` setup, which was
 //! not isolated. A whole `LcdBus` row, data phase and edges, takes about 117 us (computed,
@@ -31,9 +32,12 @@
 //!
 //! # Chips
 //!
-//! Only the ESP32-S3 exists and is tested, on an M5Stack PaperDIY and a LilyGo T5 4.7 S3 V2.4. The chip is a Cargo feature,
-//! as in `esp-hal`, so other chips can be added later. A classic ESP32 or an S2 would need an
-//! I2S parallel bus, which is not written.
+//! The `esp32s3` feature enables the hardware-tested LCD_CAM buses for the ESP32-S3.
+//! The `esp32` feature enables classic ESP32 I2S1 parallel DMA via [`i2s_parallel`].
+//! Its memory-ordering helper is host-testable, but the hardware transmitter and its
+//! integration with e-paper control signals have not yet been validated on a board.
+//! I2S only sends data and clock: board-specific GPIO/PMIC logic still needs to implement
+//! the `EpdParallelBus` refresh lifecycle.
 //!
 //! # `esp-hal` version
 //!
@@ -45,6 +49,7 @@
 //!
 //! - `blocking` (default): blocking API, forwarded to `epdpi`.
 //! - `esp32s3`: enables `esp-hal`, `lcd_bus` and `shift_reg_bus`.
+//! - `esp32`: enables `esp-hal` and the classic ESP32 I2S1 transmitter.
 //!
 //! ```toml
 //! epdpi = "0.3"
@@ -54,6 +59,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod fast_bus;
+pub mod i2s_parallel;
 pub mod shift_reg;
 
 #[cfg(feature = "esp32s3")]

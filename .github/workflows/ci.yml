@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - 'integration/**' # Run CI on hardware bring-up branches as well as the default branch.
     paths-ignore:
       - "**/README.md"
   pull_request:

@@ -44,9 +44,26 @@ any high-voltage display refresh.
    `epdpi-esp/src/inkplate5v2_timing.rs`. They do not access real GPIO,
    activate rails, or guarantee sub-microsecond physical timing. The later
    board bus must fail safe on signal/DMA errors.
-4. A full `Inkplate5v2Bus: EpdParallelBus` composing the reusable ESP32
-   I2S1 transport with direct GPIO and expander pins. Connect the
-   board-specific gate/source start/end timing to scanline boundaries.
+4. A **safety-locked** `Inkplate5v2Bus: EpdParallelBus` is now in
+   `epdpi-esp/src/inkplate5v2_bus.rs`. It owns the classic ESP32 I2S1
+   transmitter, direct LE GPIO2 / CKV GPIO32 / SPH GPIO33, and the shared
+   expander/PMIC controller. It uses the vendor's frame and row timing
+   helpers and board-specific DMA byte layout. On a GPIO, I2C, or DMA error,
+   it latches an error and requests best-effort power-down.
+
+   The constructor and `inspect()` are non-driving. The explicit
+   `prepare_low_voltage()` method changes GPIO states, configures the
+   vendor's GPIO0 clock enable (PCAL Port 1 bit 0), programs PMIC sequencing
+   while PGOOD reports zero, and does **not** enable panel bias rails.
+   This is not read-only and must not be used as the first hardware test
+   on an unknown board state.
+
+   **Critically, `EpdParallelBus::set_power(true)` is locked and always
+   returns `HardwareNotValidated`**. No display pass can be started through
+   the bus. The implementation is deliberately not an approved firmware
+   image: it still requires verified electrical timing, factory VCOM
+   readback and a safe recovery procedure. No option currently bypasses
+   the hardware lock.
 5. Board example using PSRAM-backed framebuffers. The framework uses
    4 bits per pixel, so it needs two 460,800-byte buffers and a 336-byte
    line buffer (320 data bytes plus 16 trailing clocks).
@@ -66,6 +83,25 @@ restart until reset and reinitialization.
 **Safety**: Do not run a display update on hardware until the TPS65186
 power-up and PGOOD paths are verified. Wrong rail sequencing can
 damage the panel. Do not alter factory VCOM calibration casually.
+
+## Bring-up stages and current gate
+
+1. **Read-only:** inspect the expander state without changing any registers;
+   compare Port 0 control pins, Port 1 GPIO0 clock-enable and the actual
+   board's current state against the manufacturer.
+2. **Low voltage:** only after verifying the board is idle, run explicit
+   preparation while recording the I2C transactions. This configures GPIO0
+   clock gating but not high-voltage rails.
+3. **Signal analysis:** verify the real I2S1 clock/data and CKV/SPV/SPH/LE
+   edges against Soldered with a logic analyzer. The vendor drives
+   `tx_right_first=0` whereas esp-hal 1.1 uses `1`; the host-equivalent
+   DMA byte stream alone is insufficient proof.
+4. **High voltage:** not implemented as an exposed operation yet. Do not
+   unlock until signal order, PMIC sequencing, VCOM calibration, failure
+   recovery and timeouts are independently reviewed.
+
+Never flash this branch as an active Inkplate refresh firmware. It is
+currently a host-validated, cross-compiled library workspace.
 
 ## Branch and upstream strategy
 

@@ -28,6 +28,7 @@ use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 
 const EXPANDER_ADDR: u8 = 0x20;
 const PMIC_ADDR: u8 = 0x48;
+const PCAL_INPUT0: u8 = 0x00;
 const PCAL_OUTPUT0: u8 = 0x02;
 const PCAL_OUTPUT1: u8 = 0x03;
 const PCAL_CONFIG0: u8 = 0x06;
@@ -51,6 +52,8 @@ const ALL_CONTROL: u8 = OE | GMOD | SPV | WAKEUP | PWRUP | VCOM;
 /// Port 1, bit 0 (expander pin 8) enables the ESP32 GPIO0 clock path.
 /// Only the explicit low-voltage clock setup method may modify this pin.
 const GPIO0_ENABLE: u8 = 1;
+/// P0.7 is hard-wired to the TPS65186 PWR_GOOD net in KiCad V1.1.0.
+const PWR_GOOD_PIN: u8 = 1 << 7;
 
 /// Whether the controller will allow an attempt to enable panel supplies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,8 @@ pub enum PowerState {
 /// Port 1 bit 0 (logical expander pin 8) is the GPIO0 clock enable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpanderSnapshot {
+    /// Actual P0 input levels, including physical PWR_GOOD on bit 7.
+    pub input_port0: u8,
     pub output_port0: u8,
     pub direction_port0: u8,
     pub output_port1: u8,
@@ -81,6 +86,13 @@ pub struct ExpanderSnapshot {
 }
 
 impl ExpanderSnapshot {
+    /// Logic level of the PMIC's physical PWR_GOOD signal on Port 0 bit 7.
+    /// This is a pin reading, not a substitute for PMIC register 0x0F
+    /// or for observing the actual high-voltage rails.
+    pub fn pgood_pin_high(self) -> bool {
+        self.input_port0 & PWR_GOOD_PIN != 0
+    }
+
     /// Whether GPIO0 clock enable is configured as an active HIGH output.
     pub fn clock_enabled(self) -> bool {
         self.direction_port1 & GPIO0_ENABLE == 0 && self.output_port1 & GPIO0_ENABLE != 0
@@ -197,6 +209,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
     /// It does not access a possibly sleeping TPS65186.
     pub async fn inspect_expander(&mut self) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
         Ok(ExpanderSnapshot {
+            input_port0: self.read(EXPANDER_ADDR, PCAL_INPUT0).await?,
             direction_port0: self.read(EXPANDER_ADDR, PCAL_CONFIG0).await?,
             output_port0: self.read(EXPANDER_ADDR, PCAL_OUTPUT0).await?,
             direction_port1: self.read(EXPANDER_ADDR, PCAL_CONFIG1).await?,
@@ -601,6 +614,8 @@ mod tests {
     async fn read_only_diagnostics_do_not_write_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         let snapshot = power.inspect_expander().await.unwrap();
+        assert_eq!(snapshot.input_port0, 0);
+        assert!(!snapshot.pgood_pin_high());
         assert_eq!(snapshot.output_port0, 0xff);
         assert_eq!(snapshot.direction_port0, 0xff);
         assert!(!snapshot.clock_enabled());
@@ -611,6 +626,22 @@ mod tests {
         assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
     }
     run_test!(read_only_diagnostics_do_not_write, read_only_diagnostics_do_not_write_body);
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn pgood_pin_is_read_from_port0_input_not_output_latch_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.pcal[PCAL_INPUT0 as usize] = PWR_GOOD_PIN;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        let snapshot = power.inspect_expander().await.unwrap();
+        assert!(snapshot.pgood_pin_high());
+        assert_eq!(snapshot.output_port0, 0xff);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|event| matches!(event, Event::Write(..))));
+    }
+    run_test!(pgood_pin_is_read_from_port0_input_not_output_latch, pgood_pin_is_read_from_port0_input_not_output_latch_body);
+
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),
         async(not(feature = "blocking"), keep_self)

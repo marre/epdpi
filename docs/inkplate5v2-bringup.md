@@ -103,6 +103,32 @@ damage the panel. Do not alter factory VCOM calibration casually.
 Never flash this branch as an active Inkplate refresh firmware. It is
 currently a host-validated, cross-compiled library workspace.
 
+## Verified board hardware references (KiCad V1.1.0)
+
+The manufacturer publishes the actual electrical design at
+https://github.com/SolderedElectronics/Soldered-Inkplate-5-Gen2-hardware-design
+(`CAD/V1.1.0`, `OUTPUTS/V1.1.0`). Its `MCU.kicad_sch` maps PCAL6416A
+Port 0 bit 7 to **PWR_GOOD** (TPS65186) and Port 1 bit 0 to
+**GPIO_0_MOSFET**, the control path called `GPIO0_ENABLE` in the
+manufacturer's Arduino code. `E-paper.kicad_sch` includes the
+GPIO0-to-EPD-CL path through an SN74LVC1G34 buffer. This is *not*
+a second independently usable display clock pin.
+
+The read-only `inspect_expander()` snapshot now includes the actual
+input level of P0.7 (`pgood_pin_high()`) in addition to output latches
+and directions. Input readings are **not** register writes and can be
+compared against the TPS65186's PGOOD status once wakeup/readout is safe.
+
+The documentation also notes that ESP32 GPIO0 is involved in the boot
+selection circuit (JP4, JP5). Verify the reset/boot levels, and the actual
+board revision, before configuring I2S on GPIO0 or asserting its MOSFET.
+Do not alter jumpers on the only device during initial bring-up.
+
+The panel's ED052TC4 native orientation is 720 × 1280 portrait, with
+1280 × 720 landscape used by Soldered's library. The docs identify the
+CH340C USB/UART bridge, which supports a planned ROM-boot recovery path.
+No full-flash backup or diagnostic firmware has been implemented yet.
+
 ## Branch and upstream strategy
 
 This branch is an integration workspace and is **not intended to merge

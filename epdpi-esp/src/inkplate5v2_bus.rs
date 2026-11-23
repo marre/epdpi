@@ -92,6 +92,10 @@ pub enum Inkplate5v2BusError<I2C, GPIO, DMA> {
     HardwareNotValidated,
 }
 
+/// Compact result alias for an operation that may fail in I2C, GPIO or DMA.
+pub type Inkplate5v2Result<I2cError, PinError, DmaError> =
+    Result<(), Inkplate5v2BusError<I2cError, PinError, DmaError>>;
+
 /// Shared state machine for the board. Does not silently initialize or
 /// energize the panel in its constructor.
 pub struct Inkplate5v2Bus<TX, I2C, DELAY, P> {
@@ -181,7 +185,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     /// Does not enable high-voltage rails, source outputs or send DMA data.
     pub async fn prepare_low_voltage(
         &mut self,
-    ) -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>> {
+    ) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
         if self.faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }
@@ -194,7 +198,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
 
     async fn prepare_sequence(
         &mut self,
-    ) -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>> {
+    ) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
         if self.power.state() != PowerState::Uninitialized {
             return Err(Inkplate5v2BusError::Power(
                 PowerError::InvalidState(self.power.state())
@@ -245,7 +249,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
 
     async fn require_ready(
         &mut self,
-    ) -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>> {
+    ) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
         if self.faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }
@@ -256,7 +260,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     }
 
     async fn start_frame_inner(&mut self)
-        -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>>
+        -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error>
     {
         if self.frame_open || self.row_pending {
             return Err(Inkplate5v2BusError::Faulted);
@@ -268,7 +272,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     }
 
     async fn write_row_inner(&mut self, data: &[u8])
-        -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>>
+        -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error>
     {
         if !self.frame_open || self.row_pending || data.len() != INKPLATE5V2_ROW_BYTES {
             return Err(Inkplate5v2BusError::RowLength);
@@ -285,7 +289,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     }
 
     async fn next_row_inner(&mut self)
-        -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>>
+        -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error>
     {
         if !self.frame_open || !self.row_pending {
             return Err(Inkplate5v2BusError::Faulted);
@@ -297,7 +301,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     }
 
     async fn end_frame_inner(&mut self)
-        -> Result<(), Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>>
+        -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error>
     {
         if !self.frame_open || self.row_pending {
             return Err(Inkplate5v2BusError::Faulted);
@@ -532,14 +536,10 @@ mod tests {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
         assert!(b.inspect().await.unwrap().clock_enabled());
-        assert!(matches!(
-            b.set_power(true).await,
-            Err(Inkplate5v2BusError::HardwareNotValidated)
-        ));
-        assert!(matches!(
-            b.start_frame().await,
-            Err(Inkplate5v2BusError::NotPowered)
-        ));
+        let attempt = b.set_power(true).await;
+        assert!(matches!(attempt, Err(Inkplate5v2BusError::HardwareNotValidated)));
+        let attempt = b.start_frame().await;
+        assert!(matches!(attempt, Err(Inkplate5v2BusError::NotPowered)));
         let (tx, power, pins) = b.release();
         let (i2c, _) = power.release();
         assert_eq!(tx.transmissions, 0);

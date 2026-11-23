@@ -29,7 +29,9 @@ use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 const EXPANDER_ADDR: u8 = 0x20;
 const PMIC_ADDR: u8 = 0x48;
 const PCAL_OUTPUT0: u8 = 0x02;
+const PCAL_OUTPUT1: u8 = 0x03;
 const PCAL_CONFIG0: u8 = 0x06;
+const PCAL_CONFIG1: u8 = 0x07;
 const PMIC_ENABLE: u8 = 0x01;
 const PMIC_UPSEQ0: u8 = 0x09;
 const PMIC_DWNSEQ0: u8 = 0x0b;
@@ -46,6 +48,10 @@ const PWRUP: u8 = 1 << 4;
 const VCOM: u8 = 1 << 5;
 const ALL_CONTROL: u8 = OE | GMOD | SPV | WAKEUP | PWRUP | VCOM;
 
+/// Port 1, bit 0 (expander pin 8) enables the ESP32 GPIO0 clock path.
+/// The power controller observes but deliberately never changes this pin.
+const GPIO0_ENABLE: u8 = 1;
+
 /// Whether the controller will allow an attempt to enable panel supplies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerState {
@@ -57,6 +63,28 @@ pub enum PowerState {
     On,
     /// An operation failed; further enable attempts are forbidden.
     Faulted,
+}
+
+/// Read-only snapshot of PCAL6416A output latches and directions.
+///
+/// Bits are numbered 0..7 in each port. A direction bit of 1 means input,
+/// 0 means output. An output-latch bit alone does **not** prove its GPIO
+/// voltage, or that the panel's high-voltage rails are off.
+/// Port 0 bits 0..5 control OE, GMOD, SPV, WAKEUP, PWRUP and VCOM.
+/// Port 1 bit 0 (logical expander pin 8) is the GPIO0 clock enable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpanderSnapshot {
+    pub output_port0: u8,
+    pub direction_port0: u8,
+    pub output_port1: u8,
+    pub direction_port1: u8,
+}
+
+impl ExpanderSnapshot {
+    /// Whether GPIO0 clock enable is configured as an active HIGH output.
+    pub fn clock_enabled(self) -> bool {
+        self.direction_port1 & GPIO0_ENABLE == 0 && self.output_port1 & GPIO0_ENABLE != 0
+    }
 }
 
 /// A power sequencing or I2C failure.
@@ -160,6 +188,18 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         self.write(EXPANDER_ADDR, PCAL_OUTPUT0, &[new]).await
     }
 
+    /// Read the expander register state without changing GPIOs or high-voltage
+    /// rails. This is safe as a first diagnostic after the I2C bus is ready.
+    /// It does not access a possibly sleeping TPS65186.
+    pub async fn inspect_expander(&mut self) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
+        Ok(ExpanderSnapshot {
+            direction_port0: self.read(EXPANDER_ADDR, PCAL_CONFIG0).await?,
+            output_port0: self.read(EXPANDER_ADDR, PCAL_OUTPUT0).await?,
+            direction_port1: self.read(EXPANDER_ADDR, PCAL_CONFIG1).await?,
+            output_port1: self.read(EXPANDER_ADDR, PCAL_OUTPUT1).await?,
+        })
+    }
+
     /// Inspect the initial state, disable the six control outputs, and
     /// initialize the PMIC sequencer. This never enables high-voltage rails.
     ///
@@ -171,8 +211,9 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         }
         // Any failure latches Faulted, including an inconsistent initial state.
         self.state = PowerState::Faulted;
-        let direction = self.read(EXPANDER_ADDR, PCAL_CONFIG0).await?;
-        let outputs = self.read(EXPANDER_ADDR, PCAL_OUTPUT0).await?;
+        let snapshot = self.inspect_expander().await?;
+        let direction = snapshot.direction_port0;
+        let outputs = snapshot.output_port0;
         if ((!direction) & outputs & (OE | PWRUP | VCOM)) != 0 {
             return Err(PowerError::ActiveControlPins);
         }
@@ -183,16 +224,12 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
 
         self.expander_levels(WAKEUP, WAKEUP).await?;
         self.delay.delay_ms(1).await;
-        let configured = self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0x1b, 0x00, 0x1b, 0x00]).await;
-        let checked = if configured.is_ok() {
-            let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await;
-            match pg {
-                Ok(0) => Ok(()),
-                Ok(value) => Err(PowerError::RailsAlreadyOn(value)),
-                Err(err) => Err(err),
-            }
-        } else {
-            configured
+        // Check PGOOD before writing PMIC sequencer registers. A nonzero
+        // value is an unexpected powered or partially powered condition.
+        let checked = match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
+            Ok(0) => self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0x1b, 0x00, 0x1b, 0x00]).await,
+            Ok(value) => Err(PowerError::RailsAlreadyOn(value)),
+            Err(err) => Err(err),
         };
         self.delay.delay_ms(1).await;
         let asleep = self.expander_levels(WAKEUP, 0).await;
@@ -302,13 +339,14 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if !discharged && first.is_none() {
             first = Some(PowerError::DischargeTimeout(pgood));
         }
-        // Keep attempting cleanup even after one step fails.
-        if let Err(e) = self.write(PMIC_ADDR, PMIC_ENABLE, &[0]).await
+        // Match Soldered TPS65186::powerDown(): drop WAKEUP first, then
+        // write ENABLE=0. Continue both attempts even if one fails.
+        if let Err(e) = self.expander_levels(WAKEUP, 0).await
             && first.is_none()
         {
             first = Some(e);
         }
-        if let Err(e) = self.expander_levels(WAKEUP, 0).await
+        if let Err(e) = self.write(PMIC_ADDR, PMIC_ENABLE, &[0]).await
             && first.is_none()
         {
             first = Some(e);
@@ -355,6 +393,8 @@ mod tests {
             let mut pcal = [0u8; 8];
             pcal[PCAL_CONFIG0 as usize] = 0xff;
             pcal[PCAL_OUTPUT0 as usize] = 0xff;
+            pcal[PCAL_CONFIG1 as usize] = 0xff;
+            pcal[PCAL_OUTPUT1 as usize] = 0xff;
             Self {
                 pcal,
                 pmic: [0u8; 16],
@@ -505,6 +545,43 @@ mod tests {
         sync(feature = "blocking", keep_self),
         async(not(feature = "blocking"), keep_self)
     )]
+    async fn read_only_diagnostics_do_not_write_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        let snapshot = power.inspect_expander().await.unwrap();
+        assert_eq!(snapshot.output_port0, 0xff);
+        assert_eq!(snapshot.direction_port0, 0xff);
+        assert!(!snapshot.clock_enabled());
+        assert_eq!(snapshot.output_port1, 0xff);
+        assert_eq!(snapshot.direction_port1, 0xff);
+        assert_eq!(power.state(), PowerState::Uninitialized);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+    }
+    run_test!(read_only_diagnostics_do_not_write, read_only_diagnostics_do_not_write_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn rejects_rails_already_good_without_programming_pmic_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.stuck_high_after_shutdown = true;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        assert_eq!(power.initialize().await, Err(PowerError::RailsAlreadyOn(PGOOD_ALL_RAILS)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e|
+            matches!(e, Event::Write(PMIC_ADDR, PMIC_UPSEQ0, _))));
+        assert!(i2c.events.iter().any(|e|
+            matches!(e, Event::Read(PMIC_ADDR, PMIC_PWRGOOD, PGOOD_ALL_RAILS))));
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+    }
+    run_test!(rejects_rails_already_good_without_programming_pmic, rejects_rails_already_good_without_programming_pmic_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
     async fn vcom_and_oe_wait_until_pgood_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();
@@ -544,6 +621,14 @@ mod tests {
         let (i2c, _) = power.release();
         assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
         assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
+        let wakeup_low = i2c.events.iter().rposition(|e|
+            matches!(e, Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, bytes)
+                if bytes[0] & WAKEUP == 0)
+        ).unwrap();
+        let rails_disabled = i2c.events.iter().rposition(|e|
+            matches!(e, Event::Write(PMIC_ADDR, PMIC_ENABLE, bytes) if bytes[0] == 0)
+        ).unwrap();
+        assert!(wakeup_low < rails_disabled);
         assert!(i2c.events.iter().any(|e|
             matches!(e, Event::Read(PMIC_ADDR, PMIC_PWRGOOD, 0))
         ));

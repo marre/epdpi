@@ -56,7 +56,9 @@ pub fn pack_i2s1_scanline(input: &[u8], output: &mut [u8]) -> Result<usize, Pack
     if input.len() > output.len() {
         return Err(PackError::TooLong);
     }
-    for (src, dst) in input.chunks_exact(4).zip(output[..input.len()].chunks_exact_mut(4)) {
+    let (src_words, _) = input.as_chunks::<4>();
+    let (dst_words, _) = output[..input.len()].as_chunks_mut::<4>();
+    for (src, dst) in src_words.iter().zip(dst_words) {
         dst.copy_from_slice(&[src[2], src[3], src[0], src[1]]);
     }
     Ok(input.len())

@@ -12,7 +12,7 @@ type Panel = Ed052tc4;
 
 fn simulated_i2s_wire(dma: &[u8]) -> Vec<u8> {
     let mut wire = Vec::with_capacity(dma.len());
-    for group in dma.chunks_exact(4) {
+    for group in dma.as_chunks::<4>().0 {
         // Classic ESP32 I2S1 8-bit parallel output order, from esp-hal 1.1.
         wire.extend_from_slice(&group[2..4]);
         wire.extend_from_slice(&group[0..2]);

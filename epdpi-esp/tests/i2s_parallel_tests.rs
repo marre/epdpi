@@ -20,7 +20,7 @@ fn multiple_words_keep_the_requested_wire_order() {
     // I2S1 on the classic ESP32 reverses 16-bit halves of each DMA word.
     // Simulate the peripheral's on-wire ordering to ensure the bytes match.
     let mut on_wire = Vec::new();
-    for dma_word in packed[..256].chunks_exact(4) {
+    for dma_word in packed[..256].as_chunks::<4>().0 {
         on_wire.extend_from_slice(&dma_word[2..4]);
         on_wire.extend_from_slice(&dma_word[0..2]);
     }

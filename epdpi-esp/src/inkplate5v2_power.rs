@@ -49,7 +49,7 @@ const VCOM: u8 = 1 << 5;
 const ALL_CONTROL: u8 = OE | GMOD | SPV | WAKEUP | PWRUP | VCOM;
 
 /// Port 1, bit 0 (expander pin 8) enables the ESP32 GPIO0 clock path.
-/// The power controller observes but deliberately never changes this pin.
+/// Only the explicit low-voltage clock setup method may modify this pin.
 const GPIO0_ENABLE: u8 = 1;
 
 /// Whether the controller will allow an attempt to enable panel supplies.
@@ -104,6 +104,10 @@ pub enum PowerError<E> {
     PowerGoodTimeout(u8),
     /// Rails did not all discharge during the bounded shutdown wait.
     DischargeTimeout(u8),
+    /// Clock gate is absent or is not configured as an output.
+    ClockNotEnabled,
+    /// Clock enable state cannot be verified by register readback.
+    ClockReadbackMismatch,
 }
 
 /// Controls the PCAL6416A Port 0 power pins and TPS65186 high-voltage rails.
@@ -200,6 +204,49 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         })
     }
 
+    /// Configure the GPIO0 clock-enable expander output (Port 1, bit 0).
+    ///
+    /// Only callable with rails confirmed idle. Preload output HIGH before
+    /// configuring the pin as output, as in the manufacturer setup. Other
+    /// Port 1 pins retain their current latches and directions. This does
+    /// **not** activate the TPS65186 high-voltage rails or send display data.
+    pub async fn configure_clock_gate(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::Idle {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        // Once any operation starts, an I2C error has an uncertain board
+        // state, and we refuse to re-enable the panel without reinspection.
+        self.state = PowerState::Faulted;
+        let outputs = self.read(EXPANDER_ADDR, PCAL_OUTPUT1).await?;
+        let direction = self.read(EXPANDER_ADDR, PCAL_CONFIG1).await?;
+        self.write(EXPANDER_ADDR, PCAL_OUTPUT1, &[outputs | GPIO0_ENABLE]).await?;
+        self.write(EXPANDER_ADDR, PCAL_CONFIG1, &[direction & !GPIO0_ENABLE]).await?;
+        let check = self.inspect_expander().await?;
+        if !check.clock_enabled() {
+            return Err(PowerError::ClockReadbackMismatch);
+        }
+        self.state = PowerState::Idle;
+        Ok(())
+    }
+
+    /// Set the gate start signal on PCAL6416A Port 0 bit 2.
+    /// This is only valid after PGOOD is established.
+    pub(crate) async fn set_spv(&mut self, high: bool) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::On {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        let result = self.expander_levels(SPV, if high { SPV } else { 0 }).await;
+        if result.is_err() {
+            self.state = PowerState::Faulted;
+        }
+        result
+    }
+
+    /// Delay using the same timing source as the PMIC controller.
+    pub(crate) async fn delay_us(&mut self, us: u32) {
+        self.delay.delay_us(us).await;
+    }
+
     /// Inspect the initial state, disable the six control outputs, and
     /// initialize the PMIC sequencer. This never enables high-voltage rails.
     ///
@@ -248,6 +295,12 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
     pub(crate) async fn enable(&mut self) -> Result<(), PowerError<I2C::Error>> {
         if self.state != PowerState::Idle {
             return Err(PowerError::InvalidState(self.state));
+        }
+        // GPIO0 is a boot strapping pin on classic ESP32. Refuse panel
+        // power unless the vendor's expander clock gate is configured.
+        let clock = self.inspect_expander().await?;
+        if !clock.clock_enabled() {
+            return Err(PowerError::ClockNotEnabled);
         }
         self.state = PowerState::Faulted;
         let result = self.enable_sequence().await;
@@ -558,6 +611,44 @@ mod tests {
         assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
     }
     run_test!(read_only_diagnostics_do_not_write, read_only_diagnostics_do_not_write_body);
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn clock_gate_enable_preloads_output_and_preserves_other_bits_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        let snapshot = power.inspect_expander().await.unwrap();
+        assert!(snapshot.clock_enabled());
+        assert_eq!(snapshot.output_port1, 0xff);
+        assert_eq!(snapshot.direction_port1, 0xfe);
+        let (i2c, _) = power.release();
+        let initial_output = i2c.events.iter().position(|event| matches!(
+            event, Event::Write(EXPANDER_ADDR, PCAL_OUTPUT1, _)
+        )).unwrap();
+        let direction = i2c.events.iter().position(|event| matches!(
+            event, Event::Write(EXPANDER_ADDR, PCAL_CONFIG1, _)
+        )).unwrap();
+        assert!(initial_output < direction);
+    }
+    run_test!(clock_gate_enable_preloads_output_and_preserves_other_bits, clock_gate_enable_preloads_output_and_preserves_other_bits_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn rails_cannot_start_without_clock_gate_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        assert_eq!(power.enable().await, Err(PowerError::ClockNotEnabled));
+        assert_eq!(power.state(), PowerState::Idle);
+        power.configure_clock_gate().await.unwrap();
+        power.enable().await.unwrap();
+        assert_eq!(power.state(), PowerState::On);
+    }
+    run_test!(rails_cannot_start_without_clock_gate, rails_cannot_start_without_clock_gate_body);
+
 
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),

@@ -275,11 +275,15 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if let Err(e) = self.expander_levels(OE | GMOD | SPV, 0).await {
             first = Some(e);
         }
-        if let Err(e) = self.expander_levels(VCOM, 0).await {
-            if first.is_none() { first = Some(e); }
+        if let Err(e) = self.expander_levels(VCOM, 0).await
+            && first.is_none()
+        {
+            first = Some(e);
         }
-        if let Err(e) = self.expander_levels(PWRUP, 0).await {
-            if first.is_none() { first = Some(e); }
+        if let Err(e) = self.expander_levels(PWRUP, 0).await
+            && first.is_none()
+        {
+            first = Some(e);
         }
 
         // The manufacturer's off sequence waits up to 250 ms for PGOOD=0.
@@ -299,11 +303,15 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
             first = Some(PowerError::DischargeTimeout(pgood));
         }
         // Keep attempting cleanup even after one step fails.
-        if let Err(e) = self.write(PMIC_ADDR, PMIC_ENABLE, &[0]).await {
-            if first.is_none() { first = Some(e); }
+        if let Err(e) = self.write(PMIC_ADDR, PMIC_ENABLE, &[0]).await
+            && first.is_none()
+        {
+            first = Some(e);
         }
-        if let Err(e) = self.expander_levels(WAKEUP, 0).await {
-            if first.is_none() { first = Some(e); }
+        if let Err(e) = self.expander_levels(WAKEUP, 0).await
+            && first.is_none()
+        {
+            first = Some(e);
         }
         if let Some(e) = first { Err(e) } else { Ok(()) }
     }

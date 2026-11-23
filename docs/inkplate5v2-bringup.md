@@ -16,10 +16,13 @@ timing or safe panel power.
 
 ## Hardware dependencies to implement here
 
-1. PCAL6416A GPIO expander (controls SPV, OE, GMOD, WAKEUP, PWRUP and
-   VCOM). Use a proven I2C implementation with precise error handling.
-2. TPS65186 PMIC: preserve manufacturer register sequencing,
-   VCOM calibration, rail readiness checks and safe power down.
+1. PCAL6416A GPIO expander and TPS65186 PMIC control: **software
+   controller implemented** in `epdpi-esp/src/inkplate5v2_power.rs`.
+   The controller follows Soldered's register ordering, gates OE/VCOM on
+   PGOOD, has bounded waits and a fault latch. Host tests cover failure paths.
+   **Not yet wired to real ESP32 GPIO or tested on physical rails.**
+2. Verify the PCAL6416A, PMIC and factory VCOM behavior on a physical
+   device with non-driving diagnostics. No VCOM EEPROM writes are used.
 3. A full `Inkplate5v2Bus: EpdParallelBus` composing the reusable ESP32
    I2S1 transport with direct GPIO and expander pins. Connect the
    board-specific gate/source start/end timing to scanline boundaries.
@@ -30,6 +33,14 @@ timing or safe panel power.
    check clock and data pin order using a logic analyzer, then white/black
    full refresh, eight-level gray ramp, partial updates, ghosting and
    repeated power cycles.
+
+**Safety**: This new power controller is still untested on hardware. Its
+`enable()` method must only be called after the *direct ESP32 control pins*
+(CKV, SPH, LE, data and clock) are configured to their manufacturer-required
+idle levels. There is no integration with the display bus yet. Before enabling
+rails on the only device, verify physical wiring, power-good and a recovery
+procedure. If shutdown fails, the controller latches Faulted and refuses to
+restart until reset and reinitialization.
 
 **Safety**: Do not run a display update on hardware until the TPS65186
 power-up and PGOOD paths are verified. Wrong rail sequencing can

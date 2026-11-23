@@ -60,6 +60,7 @@
 
 pub mod fast_bus;
 pub mod i2s_parallel;
+pub mod inkplate5v2_power;
 pub mod shift_reg;
 
 #[cfg(feature = "esp32s3")]

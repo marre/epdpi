@@ -153,6 +153,29 @@ jobs:
       - name: Build library
         run: cargo check --target thumbv6m-none-eabi ${{ matrix.args }}
 
+  build-esp32:
+    name: Build for classic ESP32
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        args:
+          - "-p epdpi-esp --features esp32"
+          - "-p epdpi-esp --no-default-features --features esp32"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Setup Rust for Xtensa ESP32
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+      - name: Check classic ESP32 transport
+        run: cargo check --target xtensa-esp32-none-elf -Zbuild-std=core ${{ matrix.args }}
+
   build-esp32s3:
     name: Build for ESP32-S3
     # The board this crate runs on. Xtensa needs the esp toolchain and a core built from source.

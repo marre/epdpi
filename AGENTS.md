@@ -4,8 +4,9 @@ Workspace with two crates. Sibling of `../epdsi`; follow its conventions.
 
 - `epdpi/`: `no_std` `embedded-hal` 1.0 driver for raw-parallel e-paper (ED047TC1 first). No
   vendor HAL dependency, ever.
-- `epdpi-esp/`: ESP buses (`fast_bus` register-level, `lcd_bus` LCD_CAM with DMA). The chip is a
-  feature, `esp32s3` is the only one. Only this crate may depend on `esp-hal`.
+- `epdpi-esp/`: ESP buses (`fast_bus` register-level, `lcd_bus` LCD_CAM with DMA,
+  `i2s_parallel` I2S1 DMA on classic ESP32). Both `esp32` and `esp32s3` are chip features.
+  Only this crate may depend on `esp-hal`.
 
 ## Commands (match CI)
 
@@ -21,10 +22,12 @@ cargo clippy --no-default-features --features graphics -p epdpi -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo check --target thumbv6m-none-eabi                      # RP2040 canary, core
 cargo +esp check --target xtensa-esp32s3-none-elf -Zbuild-std=core -p epdpi-esp --features esp32s3
+cargo +esp check --target xtensa-esp32-none-elf -Zbuild-std=core -p epdpi-esp --features esp32
+cargo +esp check --target xtensa-esp32-none-elf -Zbuild-std=core -p epdpi-esp --no-default-features --features esp32
 ```
 
-Never pass `--all-features` with `--workspace`: it turns on `esp32s3`, which needs the `esp`
-toolchain. CI runs the thumbv6m and xtensa checks in blocking and async mode (add
+Never pass `--all-features` with `--workspace`: it turns on chip features (`esp32` and
+`esp32s3`) simultaneously, which are mutually exclusive and need the `esp` toolchain. CI runs the thumbv6m and xtensa checks in blocking and async mode (add
 `--no-default-features` for async). Add a target only when we own hardware for it.
 
 ## Rules

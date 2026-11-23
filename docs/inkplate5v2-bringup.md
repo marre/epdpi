@@ -39,13 +39,18 @@ any high-voltage display refresh.
    signal itself is not yet driven.
    Verify the PMIC and factory VCOM behavior on a physical device with
    non-driving diagnostics. No VCOM EEPROM writes are used.
-3. A full `Inkplate5v2Bus: EpdParallelBus` composing the reusable ESP32
+3. The manufacturer-matched CKV/SPV/SPH/LE transitions are implemented as
+   **host-tested signal-sequence primitives** in
+   `epdpi-esp/src/inkplate5v2_timing.rs`. They do not access real GPIO,
+   activate rails, or guarantee sub-microsecond physical timing. The later
+   board bus must fail safe on signal/DMA errors.
+4. A full `Inkplate5v2Bus: EpdParallelBus` composing the reusable ESP32
    I2S1 transport with direct GPIO and expander pins. Connect the
    board-specific gate/source start/end timing to scanline boundaries.
-4. Board example using PSRAM-backed framebuffers. The framework uses
+5. Board example using PSRAM-backed framebuffers. The framework uses
    4 bits per pixel, so it needs two 460,800-byte buffers and a 336-byte
    line buffer (320 data bytes plus 16 trailing clocks).
-5. Physical tests: power up without display scan, verify PGOOD,
+6. Physical tests: power up without display scan, verify PGOOD,
    check clock and data pin order using a logic analyzer, then white/black
    full refresh, eight-level gray ramp, partial updates, ghosting and
    repeated power cycles.

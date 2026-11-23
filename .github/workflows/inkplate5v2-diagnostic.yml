@@ -34,9 +34,11 @@ jobs:
         with:
           workspaces: firmware/inkplate5v2-diagnostic
       - name: Build diagnostic ELF
-        run: |
-          cargo build --manifest-path firmware/inkplate5v2-diagnostic/Cargo.toml \
-            --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+        # Cargo only loads .cargo/config.toml from the current directory and
+        # its parents, not automatically from a --manifest-path child crate.
+        # The local config supplies ESP32 runtime linker scripts.
+        working-directory: firmware/inkplate5v2-diagnostic
+        run: cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
       - name: Convert to merged ESP32 image
         run: |
           cargo install espflash --locked --version 4.0.1

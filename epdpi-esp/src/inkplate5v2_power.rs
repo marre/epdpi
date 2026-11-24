@@ -43,6 +43,10 @@ const PMIC_VADJ: u8 = 0x02;
 const PMIC_VCOM1: u8 = 0x03;
 const PMIC_VCOM2: u8 = 0x04;
 const PMIC_REVID: u8 = 0x10;
+const PMIC_INT1: u8 = 0x07;
+const PMIC_INT2: u8 = 0x08;
+const INT1_POWER_FAULTS: u8 = 0x64; // TSD, HOT, UVLO
+const INT2_POWER_FAULTS: u8 = 0xfe; // all except temperature ADC completion
 const PMIC_UPSEQ0: u8 = 0x09;
 const PMIC_DWNSEQ0: u8 = 0x0b;
 const PMIC_UPSEQ1: u8 = 0x0a;
@@ -151,6 +155,14 @@ impl PmicSnapshot {
     }
 }
 
+/// Raw interrupt flags captured before sleep resets them. Each register is
+/// read-to-clear; None means no successful read, not absence of faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PmicFaultSnapshot {
+    pub int1: Option<u8>,
+    pub int2: Option<u8>,
+}
+
 /// A power sequencing or I2C failure.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -192,6 +204,10 @@ pub enum PowerError<E> {
     SequencerReadbackMismatch,
     /// PMIC enable status does not match the expected state.
     EnableReadbackMismatch(u8),
+    /// PMIC reported a supply or thermal fault while active.
+    PmicFault { int1: u8, int2: u8 },
+    /// VCOM2 has acquisition, EEPROM programming or Hi-Z mode asserted.
+    InvalidVcomMode(u8),
 }
 
 /// Controls the PCAL6416A Port 0 power pins and TPS65186 high-voltage rails.
@@ -207,6 +223,7 @@ pub struct Inkplate5v2Power<I2C, DELAY> {
     delay: DELAY,
     state: PowerState,
     idle_snapshot: Option<PmicSnapshot>,
+    fault_snapshot: PmicFaultSnapshot,
     shutdown_budget: u16,
 }
 
@@ -219,6 +236,7 @@ impl<I2C, DELAY> Inkplate5v2Power<I2C, DELAY> {
             delay,
             state: PowerState::Uninitialized,
             idle_snapshot: None,
+            fault_snapshot: PmicFaultSnapshot::default(),
             shutdown_budget: SHUTDOWN_TIMEOUT_MS,
         }
     }
@@ -232,6 +250,11 @@ impl<I2C, DELAY> Inkplate5v2Power<I2C, DELAY> {
     /// A cached value, not a live reading from the sleeping PMIC.
     pub fn idle_pmic_snapshot(&self) -> Option<PmicSnapshot> {
         self.idle_snapshot
+    }
+
+    /// Accumulated interrupt flags observed since construction.
+    pub fn pmic_fault_snapshot(&self) -> PmicFaultSnapshot {
+        self.fault_snapshot
     }
 
     /// Recover the owned peripheral and delay. Does not change any pins.
@@ -458,6 +481,29 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         Ok(())
     }
 
+    // INT1/2 clear on read (TI §8.3.8). Preserve each successfully
+    // read byte even if the other register transaction fails. Never use
+    // this operation to retry a faulted power-up.
+    async fn read_interrupts(&mut self) -> Result<(u8, u8), PowerError<I2C::Error>> {
+        let int1 = self.read(PMIC_ADDR, PMIC_INT1).await;
+        if let Ok(value) = &int1 {
+            self.fault_snapshot.int1 = Some(self.fault_snapshot.int1.unwrap_or(0) | *value);
+        }
+        let int2 = self.read(PMIC_ADDR, PMIC_INT2).await;
+        if let Ok(value) = &int2 {
+            self.fault_snapshot.int2 = Some(self.fault_snapshot.int2.unwrap_or(0) | *value);
+        }
+        Ok((int1?, int2?))
+    }
+
+    async fn verify_no_pmic_fault(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        let (int1, int2) = self.read_interrupts().await?;
+        if int1 & INT1_POWER_FAULTS != 0 || int2 & INT2_POWER_FAULTS != 0 {
+            return Err(PowerError::PmicFault { int1, int2 });
+        }
+        Ok(())
+    }
+
     /// Enable power rails using the manufacturer's sequence.
     ///
     /// **Precondition:** the *separate* ESP32 direct GPIO lines (SPH, CKV,
@@ -518,6 +564,10 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         // Preserve factory-loaded delay values. The vendor's begin() writes
         // are lost in sleep; its effective active-cycle delays are the
         // EEPROM defaults. Configure the active rail order on every wake.
+        let vcom_mode = self.read(PMIC_ADDR, PMIC_VCOM2).await?;
+        if vcom_mode & 0xe0 != 0 {
+            return Err(PowerError::InvalidVcomMode(vcom_mode));
+        }
         let up_delay = self.read(PMIC_ADDR, PMIC_UPSEQ1).await?;
         let down_delay = self.read(PMIC_ADDR, PMIC_DWNSEQ1).await?;
         self.shutdown_budget = shutdown_poll_budget(down_delay);
@@ -574,6 +624,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
                     {
                         return Err(PowerError::PanelControlLost);
                     }
+                    self.verify_no_pmic_fault().await?;
                     self.expander_levels(OE, OE).await?;
                     self.verify_live_rails_inner().await?;
                     return Ok(());
@@ -615,6 +666,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if enable & (V3P3_ENABLE | HV_ENABLE_MASK) != V3P3_ENABLE | HV_ENABLE_MASK {
             return Err(PowerError::EnableReadbackMismatch(enable));
         }
+        self.verify_no_pmic_fault().await?;
         let active = ALL_CONTROL;
         if snapshot.direction_port0 & active != 0
             || snapshot.direction_port0 & PWR_GOOD_PIN == 0
@@ -700,6 +752,9 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         {
             first = Some(e);
         }
+        // VCOM_CTRL has 62.52 us of deglitch; allow the disable to
+        // settle before PWRUP falling initiates rail power-down.
+        self.delay.delay_ms(1).await;
         if let Err(e) = self.expander_levels(PWRUP, 0).await
             && first.is_none()
         {
@@ -767,6 +822,9 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
                     Some(PowerError::DischargeTimeout(pgood))
                 };
             }
+            // Preserve fault evidence before WAKEUP low resets it. Capture
+            // is best effort and must not prevent the remaining shutdown.
+            let _ = self.read_interrupts().await;
             // ENABLE bits reflect actual rail state. Never clear individual
             // HV bits while a sequenced shutdown may still be in progress.
             if discharged {
@@ -816,6 +874,8 @@ mod tests {
     use super::*;
     use embedded_hal::i2c::{ErrorKind, ErrorType, Operation};
     use std::vec::Vec;
+    use std::rc::Rc;
+    use core::cell::Cell;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FakeError;
@@ -838,6 +898,12 @@ mod tests {
         rails_ready: bool,
         fail_sequence_write_once: bool,
         fail_on_write_attempt: Option<usize>,
+        fail_after_write_attempt: Option<usize>,
+        clock: Option<Rc<Cell<u64>>>,
+        wake_started_ns: u64,
+        rail_started_ns: u64,
+        rail_stopped_ns: Option<u64>,
+        factory_down_delay: u8,
         write_attempts: usize,
         fail_pgood_read_once: bool,
         fail_expander_read_once: bool,
@@ -861,6 +927,12 @@ mod tests {
                 rails_ready: true,
                 fail_sequence_write_once: false,
                 fail_on_write_attempt: None,
+                fail_after_write_attempt: None,
+                clock: None,
+                wake_started_ns: 0,
+                rail_started_ns: 0,
+                rail_stopped_ns: None,
+                factory_down_delay: 0x20,
                 write_attempts: 0,
                 fail_pgood_read_once: false,
                 fail_expander_read_once: false,
@@ -886,6 +958,24 @@ mod tests {
             self.pcal[PCAL_OUTPUT0 as usize] & !self.pcal[PCAL_CONFIG0 as usize] & ALL_CONTROL
         }
 
+        fn now_ns(&self) -> u64 {
+            self.clock.as_ref().map_or(0, |clock| clock.get())
+        }
+
+        // In the timed fixture, PG may be gone well before the remaining
+        // enables clear. This tests shutdown ordering, not analogue voltage.
+        fn hv_enables(&self) -> u8 {
+            if self.physical_controls() & PWRUP != 0 {
+                0x0f
+            } else if self.clock.is_some()
+                && self.rail_stopped_ns.is_some_and(|time| self.now_ns() - time < 300_000_000)
+            {
+                0x0f
+            } else {
+                0
+            }
+        }
+
         fn pgood(&self) -> u8 {
             if self.stuck_high_after_shutdown {
                 return PGOOD_ALL_RAILS;
@@ -893,6 +983,7 @@ mod tests {
             if self.rails_ready
                 && self.physical_controls() & (PWRUP | WAKEUP) == PWRUP | WAKEUP
                 && self.pmic[PMIC_ENABLE as usize] == 0x20
+                && (self.clock.is_none() || self.now_ns() - self.rail_started_ns >= 28_000_000)
             {
                 PGOOD_ALL_RAILS
             } else {
@@ -915,7 +1006,10 @@ mod tests {
             addr: u8,
             operations: &mut [Operation<'_>],
         ) -> Result<(), Self::Error> {
-            if addr == PMIC_ADDR && self.physical_controls() & WAKEUP == 0 {
+            if addr == PMIC_ADDR
+                && (self.physical_controls() & WAKEUP == 0
+                    || (self.clock.is_some() && self.now_ns() - self.wake_started_ns < 1_800_000))
+            {
                 return Err(FakeError);
             }
             let mut register = 0;
@@ -944,16 +1038,33 @@ mod tests {
                                             self.ignore_config0_write_once = false;
                                             continue; // Simulate an ACKed write the chip did not latch.
                                         }
-                                        let was_awake = self.physical_controls() & WAKEUP != 0;
+                                        let before = self.physical_controls();
                                         self.pcal[index] = *value;
-                                        if was_awake && self.physical_controls() & WAKEUP == 0 {
+                                        let after = self.physical_controls();
+                                        if before & WAKEUP == 0 && after & WAKEUP != 0 {
+                                            self.wake_started_ns = self.now_ns();
+                                        }
+                                        if before & PWRUP == 0 && after & PWRUP != 0 {
+                                            self.rail_started_ns = self.now_ns();
+                                            self.rail_stopped_ns = None;
+                                        }
+                                        if before & PWRUP != 0 && after & PWRUP == 0 {
+                                            self.rail_stopped_ns = Some(self.now_ns());
+                                        }
+                                        if before & WAKEUP != 0 && after & WAKEUP == 0 {
                                             self.pmic = Self::sleep_defaults();
+                                            self.pmic[PMIC_DWNSEQ1 as usize] = self.factory_down_delay;
+                                            self.rail_stopped_ns = None;
                                         }
                                     } else if addr == PMIC_ADDR {
                                         self.pmic[index] = *value;
                                     } else {
                                         return Err(FakeError);
                                     }
+                                }
+                                if self.fail_after_write_attempt == Some(self.write_attempts) {
+                                    self.fail_after_write_attempt = None;
+                                    return Err(FakeError);
                                 }
                             }
                         }
@@ -994,12 +1105,16 @@ mod tests {
                             } else if addr == PMIC_ADDR && register == PMIC_ENABLE {
                                 let controls = self.physical_controls();
                                 self.pmic[PMIC_ENABLE as usize]
-                                    | if controls & PWRUP != 0 { 0x0f } else { 0 }
+                                    | self.hv_enables()
                                     | if controls & VCOM != 0 { 0x10 } else { 0 }
                             } else if addr == PMIC_ADDR && register == PMIC_PWRGOOD {
                                 self.pgood()
                             } else if addr == PMIC_ADDR {
-                                self.pmic[register as usize]
+                                let value = self.pmic[register as usize];
+                                if matches!(register, PMIC_INT1 | PMIC_INT2) {
+                                    self.pmic[register as usize] = 0;
+                                }
+                                value
                             } else {
                                 return Err(FakeError);
                             };
@@ -1017,6 +1132,9 @@ mod tests {
     #[derive(Default)]
     struct FakeDelay {
         total_ns: u64,
+        clock: Option<Rc<Cell<u64>>>,
+        #[cfg(not(feature = "blocking"))]
+        suspend_once: bool,
     }
 
     #[maybe_async_cfg::maybe(
@@ -1025,7 +1143,15 @@ mod tests {
     )]
     impl DelayNs for FakeDelay {
         async fn delay_ns(&mut self, ns: u32) {
+            #[cfg(not(feature = "blocking"))]
+            if self.suspend_once {
+                self.suspend_once = false;
+                core::future::pending::<()>().await;
+            }
             self.total_ns += u64::from(ns);
+            if let Some(clock) = &self.clock {
+                clock.set(self.total_ns);
+            }
         }
     }
 
@@ -1634,5 +1760,96 @@ mod tests {
         assert_eq!(power.state(), PowerState::Faulted);
     }
     run_test!(cached_idle_is_revalidated, cached_idle_is_revalidated_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn timed_power_cycle_waits_for_wake_ramp_and_enable_clear_body() {
+        let clock = Rc::new(Cell::new(0));
+        let mut i2c = FakeI2c::new();
+        i2c.clock = Some(clock.clone());
+        i2c.factory_down_delay = 0xff;
+        i2c.pmic[PMIC_DWNSEQ1 as usize] = 0xff;
+        let delay = FakeDelay { clock: Some(clock.clone()), ..FakeDelay::default() };
+        let mut power = Inkplate5v2Power::new(i2c, delay);
+        power.initialize().await.unwrap();
+        assert!(clock.get() >= 5_000_000);
+        power.configure_clock_gate().await.unwrap();
+        for _ in 0..2 {
+            let start = clock.get();
+            power.enable().await.unwrap();
+            assert!(clock.get() - start >= 33_000_000);
+            let start = clock.get();
+            power.disable().await.unwrap();
+            assert!(clock.get() - start >= 350_000_000);
+            assert_eq!(power.state(), PowerState::Idle);
+        }
+    }
+    run_test!(timed_power_cycle_waits_for_wake_ramp_and_enable_clear,
+        timed_power_cycle_waits_for_wake_ramp_and_enable_clear_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn post_side_effect_startup_failures_are_cleaned_up_body() {
+        for offset in 1..=8 {
+            let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+            power.initialize().await.unwrap();
+            power.configure_clock_gate().await.unwrap();
+            power.i2c.fail_after_write_attempt = Some(power.i2c.write_attempts + offset);
+            assert_eq!(power.enable().await, Err(PowerError::I2c(FakeError)), "write {offset}");
+            assert_eq!(power.state(), PowerState::Faulted);
+            assert_eq!(power.i2c.physical_controls(), 0, "write {offset}");
+            assert_eq!(power.i2c.pmic[PMIC_ENABLE as usize], 0);
+        }
+    }
+    run_test!(post_side_effect_startup_failures_are_cleaned_up,
+        post_side_effect_startup_failures_are_cleaned_up_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn pmic_fault_flags_block_scanning_and_survive_sleep_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.enable().await.unwrap();
+        power.i2c.pmic[PMIC_INT2 as usize] = 0x04; // VCOMF
+        assert_eq!(power.verify_live_rails().await, Err(PowerError::PmicFault { int1: 0, int2: 4 }));
+        assert_eq!(power.state(), PowerState::Faulted);
+        power.disable().await.unwrap();
+        assert_eq!(power.state(), PowerState::Faulted);
+        assert_eq!(power.pmic_fault_snapshot().int2, Some(4));
+        assert_eq!(power.i2c.pmic[PMIC_INT2 as usize], 0);
+    }
+    run_test!(pmic_fault_flags_block_scanning_and_survive_sleep,
+        pmic_fault_flags_block_scanning_and_survive_sleep_body);
+
+    #[cfg(not(feature = "blocking"))]
+    #[test]
+    fn cancelled_shutdown_never_reuses_on_state() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        pollster::block_on(async {
+            power.initialize().await.unwrap();
+            power.configure_clock_gate().await.unwrap();
+            power.enable().await.unwrap();
+        });
+        power.delay.suspend_once = true;
+        {
+            let mut future = core::pin::pin!(power.disable());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        assert_eq!(power.state(), PowerState::Faulted);
+        assert_eq!(pollster::block_on(power.enable()), Err(PowerError::InvalidState(PowerState::Faulted)));
+        pollster::block_on(power.disable()).unwrap();
+        assert_eq!(power.i2c.physical_controls(), 0);
+        assert_eq!(power.state(), PowerState::Faulted);
+    }
 
 }

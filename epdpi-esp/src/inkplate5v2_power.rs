@@ -734,6 +734,9 @@ mod tests {
     async fn rejects_rails_already_good_without_programming_pmic_body() {
         let mut i2c = FakeI2c::new();
         i2c.stuck_high_after_shutdown = true;
+        // Isolate PMIC's internal PGOOD register from the separate PCAL
+        // P0.7 input. The read-only preflight must pass first.
+        i2c.pgood_pin_stuck_low = true;
         let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
         assert_eq!(power.initialize().await, Err(PowerError::RailsAlreadyOn(PGOOD_ALL_RAILS)));
         assert_eq!(power.state(), PowerState::Faulted);
@@ -820,6 +823,51 @@ mod tests {
         assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
     }
     run_test!(rejects_active_control_pins_on_entry, rejects_active_control_pins_on_entry_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn preflight_rejects_physical_pgood_without_writes_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.pcal[PCAL_INPUT0 as usize] = PWR_GOOD_PIN;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        assert_eq!(power.preflight_low_voltage().await, Err(PowerError::PhysicalPowerGoodAlreadyHigh));
+        assert_eq!(power.state(), PowerState::Uninitialized);
+        assert_eq!(power.initialize().await, Err(PowerError::PhysicalPowerGoodAlreadyHigh));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+    }
+    run_test!(preflight_rejects_physical_pgood_without_writes, preflight_rejects_physical_pgood_without_writes_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn preflight_rejects_pgood_configured_as_output_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.pcal[PCAL_CONFIG0 as usize] &= !PWR_GOOD_PIN;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        assert_eq!(power.preflight_low_voltage().await, Err(PowerError::PowerGoodPinNotInput));
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+    }
+    run_test!(preflight_rejects_pgood_configured_as_output, preflight_rejects_pgood_configured_as_output_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn preflight_leaves_the_board_unchanged_when_idle_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        let snapshot = power.preflight_low_voltage().await.unwrap();
+        assert!(!snapshot.pgood_pin_high());
+        assert_eq!(power.state(), PowerState::Uninitialized);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+    }
+    run_test!(preflight_leaves_the_board_unchanged_when_idle, preflight_leaves_the_board_unchanged_when_idle_body);
 
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),

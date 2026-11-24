@@ -86,6 +86,11 @@ pub trait EpdPanel {
     /// Color capability of the panel.
     const COLOR_MODE: ColorMode = ColorMode::Grayscale16;
 
+    /// Explicit opt-in for the generic four-pass FastMono waveform. This
+    /// waveform is only validated for panels which enable it; a panel with
+    /// a different vendor waveform must leave this false.
+    const SUPPORTS_FAST_MONO: bool = false;
+
     /// Factory target VCOM in millivolts, for boards that program it through a PMIC.
     const VCOM_MV: Option<i16> = None;
 

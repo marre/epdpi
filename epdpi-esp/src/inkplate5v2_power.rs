@@ -890,6 +890,28 @@ mod tests {
         sync(feature = "blocking", keep_self),
         async(not(feature = "blocking"), keep_self)
     )]
+    async fn preflight_rejects_interrupted_power_on_controls_body() {
+        for bit in [GMOD, SPV, WAKEUP] {
+            let mut i2c = FakeI2c::new();
+            i2c.pcal[PCAL_CONFIG0 as usize] &= !bit;
+            i2c.pcal[PCAL_OUTPUT0 as usize] |= bit;
+            // Physical PGOOD can still be low during an interrupted ramp.
+            assert_eq!(i2c.pcal[PCAL_INPUT0 as usize] & PWR_GOOD_PIN, 0);
+            let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+            assert_eq!(power.preflight_low_voltage().await, Err(PowerError::ActiveControlPins));
+            let (i2c, _) = power.release();
+            assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+        }
+    }
+    run_test!(
+        preflight_rejects_interrupted_power_on_controls,
+        preflight_rejects_interrupted_power_on_controls_body
+    );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
     async fn preflight_leaves_the_board_unchanged_when_idle_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         let snapshot = power.preflight_low_voltage().await.unwrap();

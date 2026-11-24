@@ -445,6 +445,7 @@ mod tests {
     #[derive(Default)]
     struct FakeI2c {
         regs0: [u8; 8],
+        pmic_enable: u8,
         writes: Vec<(u8, u8, u8)>,
     }
     impl FakeI2c {
@@ -481,6 +482,9 @@ mod tests {
                                 if addr == 0x20 && register < 8 {
                                     self.regs0[usize::from(register)] = v;
                                 }
+                                if addr == 0x48 && register == 0x01 {
+                                    self.pmic_enable = v;
+                                }
                                 register += 1;
                             }
                         }
@@ -488,8 +492,13 @@ mod tests {
                     Operation::Read(b) => for byte in b.iter_mut() {
                         *byte = if addr == 0x20 && register < 8 {
                             self.regs0[usize::from(register)]
+                        } else if addr == 0x48 && register == 0x0f
+                            && self.pmic_enable == 0x20
+                            && self.regs0[2] & 0x10 != 0
+                        {
+                            0xfa // The fake supplies all rails when the PMIC is enabled.
                         } else {
-                            0 // PMIC PGOOD=0; unmodeled registers read zero.
+                            0 // Other unmodeled PMIC registers read zero.
                         };
                         register += 1;
                     },
@@ -674,5 +683,47 @@ mod tests {
         assert_eq!(b.power.state(), PowerState::Uninitialized);
     }
     run_both!(packs_before_sph_then_waits_for_dma_before_latch, packs_before_sph_then_waits_for_dma_before_latch_body);
+
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn normal_power_off_preserves_bus_and_allows_repeated_updates_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        for _ in 0..2 {
+            // Exercise the existing crate-private power controller to simulate
+            // a fully powered state. The public HV interlock stays locked.
+            b.power.enable().await.unwrap();
+            assert_eq!(b.power.state(), PowerState::On);
+            b.set_power(false).await.unwrap();
+            assert_eq!(b.power.state(), PowerState::Idle);
+            assert!(!b.faulted);
+            assert!(!b.frame_open);
+            assert!(!b.row_pending);
+        }
+        let (tx, power, _) = b.release();
+        let (i2c, _) = power.release();
+        assert_eq!(tx.transmissions, 0);
+        assert_eq!(i2c.pmic_enable, 0);
+    }
+    run_both!(
+        normal_power_off_preserves_bus_and_allows_repeated_updates,
+        normal_power_off_preserves_bus_and_allows_repeated_updates_body
+    );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn normal_power_off_does_not_bypass_hv_lock_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        assert!(matches!(b.set_power(true).await, Err(Inkplate5v2BusError::HardwareNotValidated)));
+        b.set_power(false).await.unwrap();
+        assert!(matches!(b.set_power(true).await, Err(Inkplate5v2BusError::HardwareNotValidated)));
+    }
+    run_both!(normal_power_off_does_not_bypass_hv_lock, normal_power_off_does_not_bypass_hv_lock_body);
 
 }

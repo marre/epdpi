@@ -43,6 +43,8 @@ use crate::inkplate5v2_timing::{self as timing, Inkplate5v2Signals};
 
 /// Bytes in one ED052TC4 row including Soldered's trailing clock bytes.
 pub const INKPLATE5V2_ROW_BYTES: usize = 336;
+/// Physical ED052TC4 gate rows, exactly one row advance per scanline.
+pub const INKPLATE5V2_ROWS: usize = 720;
 
 /// Transmit the Soldered ED052TC4 row layout via classic ESP32 I2S1.
 /// The caller configures the 8-bit data GPIO, GPIO0 clock and DMA channel.
@@ -95,6 +97,8 @@ pub enum Inkplate5v2BusError<I2C, GPIO, DMA> {
     Dma(DMA),
     /// Row size must be exactly 336 bytes.
     RowLength,
+    /// An incorrect number of physical rows was requested in the frame.
+    FrameRowCount { expected: usize, actual: usize },
     /// Attempted a frame operation without verified power.
     NotPowered,
     /// A previous error leaves the board state uncertain.
@@ -116,6 +120,7 @@ pub struct Inkplate5v2Bus<TX, I2C, DELAY, P> {
     faulted: bool,
     frame_open: bool,
     row_pending: bool,
+    completed_rows: usize,
 }
 
 impl<TX, I2C, DELAY, P> Inkplate5v2Bus<TX, I2C, DELAY, P> {
@@ -133,6 +138,7 @@ impl<TX, I2C, DELAY, P> Inkplate5v2Bus<TX, I2C, DELAY, P> {
             faulted: false,
             frame_open: false,
             row_pending: false,
+            completed_rows: 0,
         }
     }
 
@@ -272,6 +278,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         let _ = self.power.disable().await;
         self.frame_open = false;
         self.row_pending = false;
+        self.completed_rows = 0;
     }
 
     async fn require_ready(
@@ -295,13 +302,23 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
         timing::frame_start(&mut s).await.map_err(Self::signal_error)?;
         self.frame_open = true;
+        self.completed_rows = 0;
         Ok(())
     }
 
     async fn write_row_inner(&mut self, data: &[u8])
         -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error>
     {
-        if !self.frame_open || self.row_pending || data.len() != INKPLATE5V2_ROW_BYTES {
+        if !self.frame_open || self.row_pending {
+            return Err(Inkplate5v2BusError::Faulted);
+        }
+        if self.completed_rows >= INKPLATE5V2_ROWS {
+            return Err(Inkplate5v2BusError::FrameRowCount {
+                expected: INKPLATE5V2_ROWS,
+                actual: self.completed_rows + 1,
+            });
+        }
+        if data.len() != INKPLATE5V2_ROW_BYTES {
             return Err(Inkplate5v2BusError::RowLength);
         }
         // Pack/size DMA data while SPH is still high. This avoids moving
@@ -328,6 +345,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
         timing::row_end(&mut s).await.map_err(Self::signal_error)?;
         self.row_pending = false;
+        self.completed_rows += 1;
         Ok(())
     }
 
@@ -336,6 +354,12 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     {
         if !self.frame_open || self.row_pending {
             return Err(Inkplate5v2BusError::Faulted);
+        }
+        if self.completed_rows != INKPLATE5V2_ROWS {
+            return Err(Inkplate5v2BusError::FrameRowCount {
+                expected: INKPLATE5V2_ROWS,
+                actual: self.completed_rows,
+            });
         }
         let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
         timing::frame_end(&mut s).await;
@@ -387,6 +411,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         let off = self.power.disable().await;
         self.frame_open = false;
         self.row_pending = false;
+        self.completed_rows = 0;
         if let Some(error) = first_gpio_error {
             self.faulted = true;
             return Err(Inkplate5v2BusError::Gpio(error));

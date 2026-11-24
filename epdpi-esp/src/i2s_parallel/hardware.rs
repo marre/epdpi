@@ -24,6 +24,8 @@ pub enum I2sTxError {
     Dma(DmaError),
     /// Resources were lost during a previous unexpected failure.
     Lost,
+    /// A scanline has not been prepared for transmission.
+    Unprepared,
 }
 
 /// DMA-backed 8-bit parallel data transmitter for the original ESP32.
@@ -39,6 +41,8 @@ pub enum I2sTxError {
 pub struct Esp32I2sTx {
     i2s: Option<I2sParallel<'static, Mode>>,
     buffer: Option<DmaTxBuf>,
+    /// True only after the next DMA row was fully packed and sized.
+    prepared: bool,
 }
 
 impl Esp32I2sTx {
@@ -47,6 +51,7 @@ impl Esp32I2sTx {
         Self {
             i2s: Some(i2s),
             buffer: Some(buffer),
+            prepared: false,
         }
     }
 
@@ -78,29 +83,64 @@ impl Esp32I2sTx {
         self.send_with_packer(line, pack_inkplate5v2_scanline).await
     }
 
+    /// Prepare the Inkplate's DMA buffer before changing SPH or CKV.
+    /// No DMA transfer starts here; the caller can still fail safely.
+    pub(crate) fn prepare_inkplate5v2_scanline(
+        &mut self,
+        line: &[u8],
+    ) -> Result<(), I2sTxError> {
+        self.prepare_with_packer(line, pack_inkplate5v2_scanline)
+    }
+
+    /// Start a previously prepared row. DMA setup and start still happen
+    /// after SPH/CKV: a HAL-level prepared transfer is not yet available.
+    pub(crate) async fn send_prepared_inkplate5v2_scanline(
+        &mut self,
+    ) -> Result<(), I2sTxError> {
+        self.send_prepared().await
+    }
+
+    fn prepare_with_packer(
+        &mut self,
+        line: &[u8],
+        packer: fn(&[u8], &mut [u8]) -> Result<usize, PackError>,
+    ) -> Result<(), I2sTxError> {
+        // A failed prepare must never leave the previous row armed.
+        self.prepared = false;
+        if self.i2s.is_none() {
+            return Err(I2sTxError::Lost);
+        }
+        let Some(buffer) = self.buffer.as_mut() else {
+            return Err(I2sTxError::Lost);
+        };
+        let len = packer(line, buffer.as_mut_slice()).map_err(I2sTxError::Pack)?;
+        buffer.set_length(len);
+        self.prepared = true;
+        Ok(())
+    }
+
     async fn send_with_packer(
         &mut self,
         line: &[u8],
         packer: fn(&[u8], &mut [u8]) -> Result<usize, PackError>,
     ) -> Result<(), I2sTxError> {
+        self.prepare_with_packer(line, packer)?;
+        self.send_prepared().await
+    }
+
+    async fn send_prepared(&mut self) -> Result<(), I2sTxError> {
+        if !self.prepared {
+            return Err(I2sTxError::Unprepared);
+        }
+        // Consume the armed row exactly once, including when DMA fails.
+        self.prepared = false;
         let Some(i2s) = self.i2s.take() else {
             return Err(I2sTxError::Lost);
         };
-        let Some(mut buffer) = self.buffer.take() else {
+        let Some(buffer) = self.buffer.take() else {
             self.i2s = Some(i2s);
             return Err(I2sTxError::Lost);
         };
-
-        let packed = packer(line, buffer.as_mut_slice());
-        let size = match packed {
-            Ok(len) => len,
-            Err(error) => {
-                self.i2s = Some(i2s);
-                self.buffer = Some(buffer);
-                return Err(I2sTxError::Pack(error));
-            }
-        };
-        buffer.set_length(size);
 
         match i2s.send(buffer) {
             Ok(transfer) => {

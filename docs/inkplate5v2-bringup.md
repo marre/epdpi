@@ -159,12 +159,13 @@ tests use a recording fake. Power sequencing still uses the existing
 
 Important differences that remain relative to Soldered's firmware:
 
-- **DMA preparation vs SPH:** Soldered sets the DMA descriptor and link,
-  then drives SPH low and CKV high immediately before setting TX_START.
-  Our board currently calls `row_start` **before** I2S buffer packing,
-  descriptor setup and HAL DMA start. Therefore the SPH-to-first-clock
-  interval is longer and variable. Before unlocking high voltage, move
-  data preparation ahead of SPH and verify edge timing with a logic analyzer.
+- **DMA preparation vs SPH:** The board now **packs and sizes DMA data
+  before** lowering SPH, separating `prepare_vendor_row()` from
+  `send_prepared_row()`. Failed preparation cannot trigger GPIO activity,
+  and a prepared row can be consumed only once. Soldered also sets the
+  DMA descriptor/link before lowering SPH; **esp-hal still sets up and
+  starts the peripheral after SPH/CKV**. This remaining timing difference
+  requires a logic-analyzer comparison before unlocking high voltage.
 - **Vendor row/SPH finish:** Soldered waits on I2S `out_total_eof`, then
   immediately raises SPH and stops the DMA link. Our HAL awaits transfer
   completion, returns peripheral resources, and only subsequently raises

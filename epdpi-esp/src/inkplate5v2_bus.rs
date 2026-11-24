@@ -53,8 +53,11 @@ pub const INKPLATE5V2_ROW_BYTES: usize = 336;
 )]
 pub trait Inkplate5v2Dma {
     type Error;
-    /// Returns only after the transmission completes.
-    async fn send_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+    /// Pack and size DMA data without changing GPIO or starting a transfer.
+    /// Must complete *before* asserting SPH.
+    fn prepare_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+    /// Transmit the already prepared row. Returns after DMA completion.
+    async fn send_prepared_row(&mut self) -> Result<(), Self::Error>;
 }
 
 #[cfg(feature = "esp32")]
@@ -64,8 +67,11 @@ pub trait Inkplate5v2Dma {
 )]
 impl Inkplate5v2Dma for crate::i2s_parallel::Esp32I2sTx {
     type Error = crate::i2s_parallel::I2sTxError;
-    async fn send_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        self.send_inkplate5v2_scanline(data).await
+    fn prepare_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+        self.prepare_inkplate5v2_scanline(data)
+    }
+    async fn send_prepared_row(&mut self) -> Result<(), Self::Error> {
+        self.send_prepared_inkplate5v2_scanline().await
     }
 }
 
@@ -294,13 +300,17 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         if !self.frame_open || self.row_pending || data.len() != INKPLATE5V2_ROW_BYTES {
             return Err(Inkplate5v2BusError::RowLength);
         }
+        // Pack/size DMA data while SPH is still high. This avoids moving
+        // 336 bytes and resizing descriptors in the time-critical interval.
+        self.tx.prepare_vendor_row(data).map_err(Inkplate5v2BusError::Dma)?;
         {
             let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
             timing::row_start(&mut s).await.map_err(Self::signal_error)?;
         }
-        // SPH low and CKV high before I2S starts. The electrical delay
-        // between these and esp-hal DMA TX start is not yet verified.
-        self.tx.send_vendor_row(data).await.map_err(Inkplate5v2BusError::Dma)?;
+        // Still not cycle-equivalent to Soldered: esp-hal sets up its DMA
+        // descriptor and starts TX here, after SPH/CKV. Measure this
+        // interval before enabling any panel bias rails.
+        self.tx.send_prepared_row().await.map_err(Inkplate5v2BusError::Dma)?;
         self.row_pending = true;
         Ok(())
     }
@@ -490,6 +500,8 @@ mod tests {
     #[derive(Default)]
     struct FakeTx {
         transmissions: usize,
+        preparations: usize,
+        prepared: bool,
     }
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),
@@ -497,7 +509,14 @@ mod tests {
     )]
     impl Inkplate5v2Dma for FakeTx {
         type Error = Infallible;
-        async fn send_vendor_row(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        fn prepare_vendor_row(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            self.preparations += 1;
+            self.prepared = true;
+            Ok(())
+        }
+        async fn send_prepared_row(&mut self) -> Result<(), Self::Error> {
+            assert!(self.prepared);
+            self.prepared = false;
             self.transmissions += 1;
             Ok(())
         }

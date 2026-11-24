@@ -849,6 +849,47 @@ mod tests {
         sync(feature = "blocking", keep_self),
         async(not(feature = "blocking"), keep_self)
     )]
+    async fn live_rails_check_accepts_healthy_supply_and_rejects_a_dropped_gate_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.enable().await.unwrap();
+        power.verify_live_rails().await.unwrap();
+        // PGOOD remains ready, but a source output-enable pin unexpectedly
+        // drops. PGOOD alone cannot demonstrate the panel is ready to scan.
+        power.i2c.pcal[PCAL_OUTPUT0 as usize] &= !OE;
+        assert_eq!(power.verify_live_rails().await, Err(PowerError::PanelControlLost));
+        assert_eq!(power.state(), PowerState::Faulted);
+    }
+    run_test!(
+        live_rails_check_accepts_healthy_supply_and_rejects_a_dropped_gate,
+        live_rails_check_accepts_healthy_supply_and_rejects_a_dropped_gate_body
+    );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn live_rails_i2c_failure_latches_fault_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.enable().await.unwrap();
+        power.i2c.fail_pgood_read_once = true;
+        assert_eq!(power.verify_live_rails().await, Err(PowerError::I2c(FakeError)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        assert_eq!(power.enable().await, Err(PowerError::InvalidState(PowerState::Faulted)));
+    }
+    run_test!(
+        live_rails_i2c_failure_latches_fault,
+        live_rails_i2c_failure_latches_fault_body
+    );
+
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
     async fn powers_down_to_verified_zero_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         power.initialize().await.unwrap();

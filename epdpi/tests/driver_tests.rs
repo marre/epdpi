@@ -41,13 +41,13 @@ fn vcom_defaults_to_panel_and_can_be_overridden() {
     let d = EpdDisplayBuilder::<P>::new()
         .build(RecordingBus::default(), &mut prev, &mut line)
         .unwrap();
-    assert_eq!(d.vcom_mv(), -2000);
+    assert_eq!(d.vcom_mv(), Some(-2000));
     drop(d);
     let d = EpdDisplayBuilder::<P>::new()
         .with_vcom(-2150)
         .build(RecordingBus::default(), &mut prev, &mut line)
         .unwrap();
-    assert_eq!(d.vcom_mv(), -2150);
+    assert_eq!(d.vcom_mv(), Some(-2150));
 }
 
 #[maybe_async_cfg::maybe(

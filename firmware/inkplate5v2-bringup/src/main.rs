@@ -186,8 +186,7 @@ fn main() -> ! {
         }
         // Exercise the same shutdown path used after a refresh, with HV
         // never enabled. The diagnostic then stays in the released state.
-        use epdpi::EpdParallelBus;
-        match bus.set_power(false) {
+        match bus.shutdown_panel() {
             Ok(()) => esp_println::println!("Panel GPIO shutdown complete; HV never enabled."),
             Err(error) => esp_println::println!("Panel GPIO shutdown failed: {error:?}"),
         }

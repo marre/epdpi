@@ -347,9 +347,12 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         if self.faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }
+        self.faulted = true;
         let result = self.prepare_sequence().await;
-        if result.is_err() {
-            self.faulted = true;
+        if result.is_ok() {
+            self.faulted = false;
+        } else if self.power.state() == PowerState::Idle && !self.io_released {
+            let _ = self.shutdown(true).await;
         }
         result
     }
@@ -362,6 +365,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         // while PMIC controls are still low.
         if self.io_released {
             self.power.rearm_panel_controls().await.map_err(Inkplate5v2BusError::Power)?;
+            self.io_released = false;
         } else {
             self.power.preflight_low_voltage().await.map_err(Inkplate5v2BusError::Power)?;
             self.power.initialize().await.map_err(Inkplate5v2BusError::Power)?;
@@ -381,6 +385,12 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         self.power.configure_clock_gate().await.map_err(Inkplate5v2BusError::Power)?;
         self.io_released = false;
         Ok(())
+    }
+
+    /// Shut down prepared panel GPIOs and request PMIC off. This is also
+    /// available to the HV-locked low-voltage diagnostic firmware.
+    pub async fn shutdown_panel(&mut self) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
+        self.set_power(false).await
     }
 
     /// Non-driving snapshot. Does not require or establish an initialized
@@ -460,6 +470,13 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         self.frame_open = false;
         self.row_pending = false;
         self.completed_rows = 0;
+        // Record a successfully released state even if quiescing reported
+        // an earlier error. A retry must not drive the pins again.
+        self.io_released = off.is_ok()
+            && clock_data_z.is_ok()
+            && expander_z.is_ok()
+            && first_gpio_error.is_none()
+            && self.power.state() == PowerState::Idle;
         gate.map_err(Inkplate5v2BusError::Power)?;
         clock_data_low.map_err(Inkplate5v2BusError::Dma)?;
         if let Some(error) = first_gpio_error {
@@ -468,7 +485,6 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         off.map_err(Inkplate5v2BusError::Power)?;
         clock_data_z.map_err(Inkplate5v2BusError::Dma)?;
         expander_z.map_err(Inkplate5v2BusError::Power)?;
-        self.io_released = self.power.state() == PowerState::Idle;
         if emergency || previously_faulted || self.power.state() == PowerState::Faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }

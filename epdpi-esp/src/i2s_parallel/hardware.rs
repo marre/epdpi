@@ -6,6 +6,7 @@ use esp_hal::Async;
 use esp_hal::Blocking;
 use esp_hal::dma::{DmaError, DmaTxBuf};
 use esp_hal::i2s::parallel::I2sParallel;
+use esp_hal::time::{Duration, Instant};
 
 use super::{PackError, pack_i2s1_scanline, pack_inkplate5v2_scanline};
 
@@ -26,6 +27,9 @@ pub enum I2sTxError {
     Lost,
     /// A scanline has not been prepared for transmission.
     Unprepared,
+    /// DMA transmission did not reach HAL's completed/idle state within
+    /// the bounded row budget. The transmitter is no longer reusable.
+    TimedOut,
 }
 
 /// DMA-backed 8-bit parallel data transmitter for the original ESP32.
@@ -144,22 +148,25 @@ impl Esp32I2sTx {
 
         match i2s.send(buffer) {
             Ok(transfer) => {
-                #[cfg(feature = "blocking")]
-                {
-                    let (i2s, buffer) = transfer.wait();
-                    self.i2s = Some(i2s);
-                    self.buffer = Some(buffer);
-                    Ok(())
+                // The HAL's transfer.wait() and async wait_for_done()
+                // are unbounded. Never wait indefinitely for a stalled
+                // panel scanline. The transfer's Drop stops TX/DMA if the
+                // deadline is exceeded and the entire bus latches a fault.
+                // The HAL's *send()* start path itself still has internal
+                // unbounded waits; that limitation is documented and must
+                // be addressed before enabling HV on a real panel.
+                let start = Instant::now();
+                while !transfer.is_done() {
+                    if start.elapsed() >= Duration::from_millis(25) {
+                        drop(transfer);
+                        return Err(I2sTxError::TimedOut);
+                    }
+                    core::hint::spin_loop();
                 }
-                #[cfg(not(feature = "blocking"))]
-                {
-                    let mut transfer = transfer;
-                    let result = transfer.wait_for_done().await;
-                    let (i2s, buffer) = transfer.wait();
-                    self.i2s = Some(i2s);
-                    self.buffer = Some(buffer);
-                    result.map_err(I2sTxError::Dma)
-                }
+                let (i2s, buffer) = transfer.wait();
+                self.i2s = Some(i2s);
+                self.buffer = Some(buffer);
+                Ok(())
             }
             Err((error, i2s, buffer)) => {
                 self.i2s = Some(i2s);

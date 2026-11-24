@@ -114,6 +114,10 @@ pub enum PowerError<E> {
     RailsAlreadyOn(u8),
     /// Not all rails became good within the startup timeout.
     PowerGoodTimeout(u8),
+    /// A previously energized panel lost one or more PMIC rails.
+    PowerGoodLost(u8),
+    /// Source/PMIC control signals are no longer asserted while scanning.
+    PanelControlLost,
     /// Rails did not all discharge during the bounded shutdown wait.
     DischargeTimeout(u8),
     /// Clock gate is absent or is not configured as an output.
@@ -385,6 +389,36 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         } else {
             Err(PowerError::PowerGoodTimeout(last))
         }
+    }
+
+    /// Confirm the supply and output gates are still valid immediately
+    /// before a new frame is clocked. Cached `PowerState::On` alone does
+    /// not prove rails remained good following an earlier frame.
+    pub(crate) async fn verify_live_rails(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::On {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        let result = self.verify_live_rails_inner().await;
+        if result.is_err() {
+            self.state = PowerState::Faulted;
+        }
+        result
+    }
+
+    async fn verify_live_rails_inner(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        let status = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+        if status != PGOOD_ALL_RAILS {
+            return Err(PowerError::PowerGoodLost(status));
+        }
+        let snapshot = self.inspect_expander().await?;
+        if !snapshot.pgood_pin_high() {
+            return Err(PowerError::PhysicalPowerGoodLow);
+        }
+        let active = OE | VCOM | PWRUP;
+        if snapshot.direction_port0 & active != 0 || snapshot.output_port0 & active != active {
+            return Err(PowerError::PanelControlLost);
+        }
+        Ok(())
     }
 
     /// Disable VCOM and panel output, request rails off and wait until PGOOD

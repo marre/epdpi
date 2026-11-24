@@ -8,6 +8,10 @@
 //! Nominal microsecond delays in this module do not include PCAL6416A
 //! I2C transaction time, HAL overhead, or the DMA transfer. Only a logic
 //! analyzer can establish whether the physical edges match the reference.
+//!
+//! Every `busy_wait_us` call is **synchronous busy waiting**. Even the async
+//! signal variant never awaits a timer. Only SPV I2C transactions and DMA
+//! may yield; real pin-to-pin timing still needs physical verification.
 
 /// The four panel controls involved in frame and row scan sequencing.
 /// CKV, SPH and LE are ESP32 direct GPIO; SPV is on PCAL6416A Port 0.
@@ -27,8 +31,10 @@ pub trait Inkplate5v2Signals {
     async fn set_sph(&mut self, high: bool) -> Result<(), Self::Error>;
     /// Gate start signal, expander Port 0 bit 2.
     async fn set_spv(&mut self, high: bool) -> Result<(), Self::Error>;
-    /// Delay in microseconds. Actual elapsed time also includes bus operations.
-    async fn delay_us(&mut self, us: u32);
+    /// **Synchronous busy wait**, even when the surrounding signal API is
+    /// async. This must not yield to an executor or schedule a timer.
+    /// Busy waits are best effort: interrupts and I2C calls still add time.
+    fn busy_wait_us(&mut self, us: u32);
 }
 
 /// Drive the direct pins to the idle levels used in Soldered's `einkOn()`.
@@ -56,20 +62,20 @@ pub async fn frame_start<S: Inkplate5v2Signals>(
     pins: &mut S,
 ) -> Result<(), S::Error> {
     pins.set_ckv(true).await?;
-    pins.delay_us(7).await;
+    pins.busy_wait_us(7);
     pins.set_spv(false).await?;
-    pins.delay_us(10).await;
+    pins.busy_wait_us(10);
     pins.set_ckv(false).await?;
     pins.set_ckv(true).await?;
-    pins.delay_us(8).await;
+    pins.busy_wait_us(8);
     pins.set_spv(true).await?;
-    pins.delay_us(10).await;
+    pins.busy_wait_us(10);
     pins.set_ckv(false).await?;
     pins.set_ckv(true).await?;
-    pins.delay_us(18).await;
+    pins.busy_wait_us(18);
     pins.set_ckv(false).await?;
     pins.set_ckv(true).await?;
-    pins.delay_us(18).await;
+    pins.busy_wait_us(18);
     pins.set_ckv(false).await?;
     pins.set_ckv(true).await
 }
@@ -108,7 +114,7 @@ pub async fn row_end<S: Inkplate5v2Signals>(
     async(not(feature = "blocking"), keep_self)
 )]
 pub async fn frame_end<S: Inkplate5v2Signals>(pins: &mut S) {
-    pins.delay_us(230).await;
+    pins.busy_wait_us(230);
 }
 
 #[cfg(test)]
@@ -157,7 +163,7 @@ mod tests {
             if !high && self.fail_on_spv_low { return Err(Fault); }
             Ok(())
         }
-        async fn delay_us(&mut self, us: u32) {
+        fn busy_wait_us(&mut self, us: u32) {
             self.events.push(Event::Wait(us));
         }
     }

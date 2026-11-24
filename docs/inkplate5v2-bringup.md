@@ -146,6 +146,50 @@ The panel's ED052TC4 native orientation is 720 × 1280 portrait, with
 CH340C USB/UART bridge, which supports a planned ROM-boot recovery path.
 No full-flash backup or diagnostic firmware has been implemented yet.
 
+## Microsecond timing strategy and vendor deltas (2026-11-24)
+
+The CKV/SPV/SPH/LE timing trait now uses synchronous `busy_wait_us()`
+instead of awaiting a delay. The classic ESP32 bus directly calls
+`esp_hal::delay::Delay::new().delay_micros(us)`, whose implementation
+polls `Instant` in a blocking loop. This applies to the blocking and async
+driver variants. The host-only bus shim is unreachable for display scanning
+because `set_power(true)` remains permanently locked; its event-sequence
+tests use a recording fake. Power sequencing still uses the existing
+`embedded-hal` delays, which are not part of the microsecond row timing.
+
+Important differences that remain relative to Soldered's firmware:
+
+- **DMA preparation vs SPH:** Soldered sets the DMA descriptor and link,
+  then drives SPH low and CKV high immediately before setting TX_START.
+  Our board currently calls `row_start` **before** I2S buffer packing,
+  descriptor setup and HAL DMA start. Therefore the SPH-to-first-clock
+  interval is longer and variable. Before unlocking high voltage, move
+  data preparation ahead of SPH and verify edge timing with a logic analyzer.
+- **Vendor row/SPH finish:** Soldered waits on I2S `out_total_eof`, then
+  immediately raises SPH and stops the DMA link. Our HAL awaits transfer
+  completion, returns peripheral resources, and only subsequently raises
+  SPH. Confirm that the extra software overhead is acceptable.
+- **Peripheral configuration:** Soldered explicitly configures
+  `tx_right_first=0`, FIFO packing, per-row TX reset, and clock divider;
+  `esp-hal` uses its own LCD/I2S setup (including a different
+  `tx_right_first`). Our byte-equivalence test is necessary but not proof
+  of physical wire order or sample-edge polarity.
+- **I2C overhead:** SPV goes through PCAL6416A I2C; no busy wait can
+  remove the I2C transaction duration. A nominal 7- or 10-us wait is
+  a **minimum**, not a guaranteed exact edge-to-edge pulse width.
+- **Power-off GPIO:** Soldered additionally tri-states panel GPIO after
+  shutdown (`pinsZstate`). Our bus currently idles direct pins and attempts
+  a PMIC shutdown but does not perform equivalent pin tri-stating or
+  explicitly quiesce the I2S clock peripheral.
+- **Board setup:** Vendor initializes other expander Port 1 pins and
+  disables peripheral power domains including SD. Our code preserves
+  unrelated pins intentionally to avoid affecting a device with unknown
+  configuration. This difference should be reviewed before power testing.
+
+The **first diagnostic firmware** does not use this timing code and
+cannot turn on the e-paper supplies. The locked high-voltage state
+remains unchanged.
+
 ## Branch and upstream strategy
 
 This branch is an integration workspace and is **not intended to merge

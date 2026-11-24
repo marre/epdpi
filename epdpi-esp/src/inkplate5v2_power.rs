@@ -255,11 +255,6 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         result
     }
 
-    /// Delay using the same timing source as the PMIC controller.
-    pub(crate) async fn delay_us(&mut self, us: u32) {
-        self.delay.delay_us(us).await;
-    }
-
     /// Inspect the initial state, disable the six control outputs, and
     /// initialize the PMIC sequencer. This never enables high-voltage rails.
     ///

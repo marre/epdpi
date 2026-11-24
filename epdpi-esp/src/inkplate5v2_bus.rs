@@ -21,6 +21,11 @@
 //! GPIO4/5/18/19/23/25/26/27, supplied in a preconfigured transmitter.
 //! The same I2C owner sequences SPV and PMIC, preventing conflicting writes.
 //!
+//! The CKV/SPV/SPH/LE microsecond delays call `esp_hal::delay::Delay`,
+//! whose elapsed-time loop **busy-waits** on classic ESP32 in blocking
+//! and async builds alike. Host builds use a no-op delay only in the
+//! permanently HV-locked simulation path. No hardware timing validation.
+//!
 //! Failure in a signal or DMA transfer latches a bus fault and prevents
 //! further scanning. It makes a best-effort power shutdown. Software
 //! cancellation/reset can still interrupt cleanup; physical validation is
@@ -169,8 +174,20 @@ impl<I2C: I2c, DELAY: DelayNs, P: OutputPin> Inkplate5v2Signals
     async fn set_spv(&mut self, high: bool) -> Result<(), Self::Error> {
         self.power.set_spv(high).await.map_err(Inkplate5v2BusError::Power)
     }
-    async fn delay_us(&mut self, us: u32) {
-        self.power.delay_us(us).await;
+    fn busy_wait_us(&mut self, us: u32) {
+        #[cfg(feature = "esp32")]
+        {
+            // Directly invoke the HAL's elapsed-time busy loop. Never await
+            // an async timer or yield between time-critical GPIO transitions.
+            esp_hal::delay::Delay::new().delay_micros(us);
+        }
+        #[cfg(not(feature = "esp32"))]
+        {
+            // Host-only simulation cannot activate HV (set_power(true) is
+            // locked), so no real frame runs. Fake signal tests separately
+            // record and verify the requested minimum delays.
+            let _ = us;
+        }
     }
 }
 

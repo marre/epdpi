@@ -343,7 +343,15 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         }
         // GPIO0 is a boot strapping pin on classic ESP32. Refuse panel
         // power unless the vendor's expander clock gate is configured.
-        let clock = self.inspect_expander().await?;
+        let clock = match self.inspect_expander().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // Read-only doesn't mean failure can be retried blindly:
+                // an I2C failure leaves current clock-gate state unknown.
+                self.state = PowerState::Faulted;
+                return Err(error);
+            }
+        };
         if !clock.clock_enabled() {
             return Err(PowerError::ClockNotEnabled);
         }
@@ -414,7 +422,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if !snapshot.pgood_pin_high() {
             return Err(PowerError::PhysicalPowerGoodLow);
         }
-        let active = OE | VCOM | PWRUP;
+        let active = OE | VCOM | PWRUP | GMOD | SPV;
         if snapshot.direction_port0 & active != 0 || snapshot.output_port0 & active != active {
             return Err(PowerError::PanelControlLost);
         }
@@ -545,6 +553,7 @@ mod tests {
         fail_on_write_attempt: Option<usize>,
         write_attempts: usize,
         fail_pgood_read_once: bool,
+        fail_expander_read_once: bool,
         stuck_high_after_shutdown: bool,
         pgood_pin_stuck_low: bool,
         pgood_pin_stuck_high: bool,
@@ -566,6 +575,7 @@ mod tests {
                 fail_on_write_attempt: None,
                 write_attempts: 0,
                 fail_pgood_read_once: false,
+                fail_expander_read_once: false,
                 stuck_high_after_shutdown: false,
                 pgood_pin_stuck_low: false,
                 pgood_pin_stuck_high: false,
@@ -634,6 +644,10 @@ mod tests {
                         }
                     }
                     Operation::Read(out) => {
+                        if addr == EXPANDER_ADDR && self.fail_expander_read_once {
+                            self.fail_expander_read_once = false;
+                            return Err(FakeError);
+                        }
                         if addr == PMIC_ADDR && register == PMIC_PWRGOOD
                             && self.fail_pgood_read_once
                         {
@@ -799,6 +813,31 @@ mod tests {
         assert_eq!(power.state(), PowerState::On);
     }
     run_test!(rails_cannot_start_without_clock_gate, rails_cannot_start_without_clock_gate_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn enable_clock_preflight_i2c_fault_is_not_retriable_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.i2c.fail_expander_read_once = true;
+        assert_eq!(power.enable().await, Err(PowerError::I2c(FakeError)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        assert_eq!(power.enable().await, Err(PowerError::InvalidState(PowerState::Faulted)));
+        let (i2c, _) = power.release();
+        assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
+        assert!(!i2c.events.iter().any(|e|
+            matches!(e, Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, bytes)
+                if bytes[0] & (OE | VCOM) != 0)
+        ));
+    }
+    run_test!(
+        enable_clock_preflight_i2c_fault_is_not_retriable,
+        enable_clock_preflight_i2c_fault_is_not_retriable_body
+    );
+
 
 
     #[maybe_async_cfg::maybe(

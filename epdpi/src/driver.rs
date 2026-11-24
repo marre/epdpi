@@ -66,7 +66,9 @@ impl<PANEL: EpdPanel> EpdDisplayBuilder<PANEL> {
             bus,
             prev_buffer,
             scanline,
-            vcom_mv: self.vcom_mv.or(PANEL::VCOM_MV).unwrap_or(-2000),
+            // Never manufacture a default VCOM for an unknown panel.
+            // ED052TC4 is factory calibrated; no fixed VCOM is provided.
+            vcom_mv: self.vcom_mv.or(PANEL::VCOM_MV),
             _panel: PhantomData,
         })
     }
@@ -77,13 +79,15 @@ pub struct EpdDisplay<'a, BUS, PANEL> {
     bus: BUS,
     prev_buffer: &'a mut [u8],
     scanline: &'a mut [u8],
-    vcom_mv: i16,
+    vcom_mv: Option<i16>,
     _panel: PhantomData<PANEL>,
 }
 
 impl<BUS, PANEL> EpdDisplay<'_, BUS, PANEL> {
-    /// VCOM target in millivolts the display was built with.
-    pub fn vcom_mv(&self) -> i16 {
+    /// Optional VCOM target in millivolts. `None` means the panel/PMIC
+    /// must supply its factory-calibrated value; do not invent a default.
+    /// This merely reports configuration and never programs PMIC EEPROM.
+    pub fn vcom_mv(&self) -> Option<i16> {
         self.vcom_mv
     }
 

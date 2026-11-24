@@ -1,0 +1,30 @@
+[package]
+name = "inkplate5v2-bringup"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Staged, high-voltage-locked Inkplate 5 Gen 2 ESP32 bring-up firmware"
+
+# An independent workspace, like the first-stage diagnostic. The default
+# firmware performs read-only register inspection; the opt-in feature may
+# modify low-voltage GPIO and PMIC sequencing registers, but never enables
+# e-paper high voltage or sends display scanlines.
+[workspace]
+
+[features]
+default = []
+low-voltage-prep = []
+
+[dependencies]
+epdpi-esp = { path = "../../epdpi-esp", default-features = false, features = ["blocking", "esp32"] }
+esp-hal = { version = "~1.1.0", features = ["esp32", "unstable"] }
+esp-println = { version = "=0.17.0", default-features = false, features = ["esp32", "uart"] }
+esp-backtrace = { version = "=0.19.0", default-features = false, features = ["esp32", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "=0.5.0", features = ["esp32"] }
+
+[profile.release]
+opt-level = "s"
+debug = true
+lto = "fat"
+codegen-units = 1

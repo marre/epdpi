@@ -13,3 +13,14 @@ pub enum ValidationError {
         provided: usize,
     },
 }
+
+/// Error from a refresh attempt. Unsupported modes are rejected before
+/// activating power; the bus error variant preserves transport failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefreshError<E> {
+    /// The panel has no valid drive waveform for the requested refresh mode.
+    UnsupportedMode(crate::waveform::RefreshMode),
+    /// The power, scanline or GPIO bus reported an error.
+    Bus(E),
+}

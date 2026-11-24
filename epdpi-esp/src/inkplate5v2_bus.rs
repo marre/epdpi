@@ -663,7 +663,9 @@ mod tests {
     async fn unsafe_entry_must_not_touch_any_output_body() {
         let mut fake = FakeI2c::fresh();
         // P0.7 high means the e-paper rails may still be energized.
-        fake.regs0[0] = 0x80;
+        // Model a physical input, not the PCAL input register's stale
+        // snapshot, to keep the mock faithful to the live pin override.
+        fake.physical_pgood.set(Some(true));
         let mut b = bus_with_i2c(fake);
         let result = b.prepare_low_voltage().await;
         assert!(matches!(

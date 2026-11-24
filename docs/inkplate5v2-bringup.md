@@ -1,3 +1,13 @@
+> **Current implementation plan (2026-11-24):**
+> [ED052TC4 / Inkplate 5 Gen 2 implementation plan](inkplate5v2-implementation-plan.md)
+> is the authoritative forward-looking work plan. The hardware owner has no
+> oscilloscope, logic analyzer or voltmeter. We retain `esp-hal` I2S1 DMA
+> unless a specific fault justifies changes; exact vendor DMA/SPH timing is
+> **not** a prerequisite. The older notes below preserve earlier risk analysis,
+> including instrumentation-based gates that are **superseded for planning**.
+> Software readbacks and a successful image cannot prove electrical safety;
+> the high-voltage lock remains until an explicit, reviewed test path is made.
+
 ## First-stage read-only diagnostic firmware and recovery
 
 A separate classic ESP32 diagnostic application lives at

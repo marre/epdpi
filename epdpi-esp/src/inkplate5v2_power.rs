@@ -1010,4 +1010,28 @@ mod tests {
         physical_pgood_must_match_pmic_before_vcom_and_oe_body
     );
 
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn physical_pgood_stuck_high_after_pmic_shutdown_latches_fault_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.enable().await.unwrap();
+        // Simulate a broken PCAL P0.7 input while PMIC's register reads 0.
+        power.i2c.pgood_pin_stuck_high = true;
+        assert_eq!(power.disable().await, Err(PowerError::PhysicalPowerGoodStillHigh));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, delay) = power.release();
+        assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+        assert!(delay.total_ns >= u64::from(SHUTDOWN_TIMEOUT_MS) * 1_000_000);
+    }
+    run_test!(
+        physical_pgood_stuck_high_after_pmic_shutdown_latches_fault,
+        physical_pgood_stuck_high_after_pmic_shutdown_latches_fault_body
+    );
+
 }

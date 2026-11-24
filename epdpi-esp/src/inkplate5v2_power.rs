@@ -122,6 +122,8 @@ pub enum PowerError<E> {
     ClockReadbackMismatch,
     /// PMIC reports all rails ready but the separate physical PGOOD pin is low.
     PhysicalPowerGoodLow,
+    /// PMIC reports discharged rails but the independent PGOOD pin is still high.
+    PhysicalPowerGoodStillHigh,
     /// The PGOOD pin is unexpectedly high before touching power/control pins.
     PhysicalPowerGoodAlreadyHigh,
     /// Expander P0.7 must be configured as an input to observe PGOOD.
@@ -365,19 +367,22 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         for _ in 0..STARTUP_TIMEOUT_MS {
             last = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
             if last == PGOOD_ALL_RAILS {
-                // The PMIC status byte alone is not enough. The board also
-                // routes the physical PGOOD signal to expander P0.7.
-                // Refuse VCOM/OE if they disagree.
-                if !self.inspect_expander().await?.pgood_pin_high() {
-                    return Err(PowerError::PhysicalPowerGoodLow);
+                // Both independent indicators must agree; allow the PCAL
+                // input to settle until the bounded startup deadline rather
+                // than faulting on a transient disagreement.
+                if self.inspect_expander().await?.pgood_pin_high() {
+                    self.expander_levels(VCOM, VCOM).await?;
+                    self.expander_levels(OE, OE).await?;
+                    return Ok(());
                 }
-                self.expander_levels(VCOM, VCOM).await?;
-                self.expander_levels(OE, OE).await?;
-                return Ok(());
             }
             self.delay.delay_ms(1).await;
         }
-        Err(PowerError::PowerGoodTimeout(last))
+        if last == PGOOD_ALL_RAILS {
+            Err(PowerError::PhysicalPowerGoodLow)
+        } else {
+            Err(PowerError::PowerGoodTimeout(last))
+        }
     }
 
     /// Disable VCOM and panel output, request rails off and wait until PGOOD
@@ -422,9 +427,26 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         // The manufacturer's off sequence waits up to 250 ms for PGOOD=0.
         let mut pgood = 0xff;
         let mut discharged = false;
+        let mut physical_high = false;
         for _ in 0..SHUTDOWN_TIMEOUT_MS {
             match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
-                Ok(0) => { discharged = true; break; }
+                Ok(0) => {
+                    pgood = 0;
+                    match self.inspect_expander().await {
+                        Ok(snapshot) if !snapshot.pgood_pin_high() => {
+                            discharged = true;
+                            break;
+                        }
+                        Ok(_) => {
+                            physical_high = true;
+                            self.delay.delay_ms(1).await;
+                        }
+                        Err(e) => {
+                            if first.is_none() { first = Some(e); }
+                            break;
+                        }
+                    }
+                }
                 Ok(value) => { pgood = value; self.delay.delay_ms(1).await; }
                 Err(e) => {
                     if first.is_none() { first = Some(e); }
@@ -433,7 +455,11 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
             }
         }
         if !discharged && first.is_none() {
-            first = Some(PowerError::DischargeTimeout(pgood));
+            first = if physical_high && pgood == 0 {
+                Some(PowerError::PhysicalPowerGoodStillHigh)
+            } else {
+                Some(PowerError::DischargeTimeout(pgood))
+            };
         }
         // Match Soldered TPS65186::powerDown(): drop WAKEUP first, then
         // write ENABLE=0. Continue both attempts even if one fails.
@@ -483,6 +509,7 @@ mod tests {
         fail_pgood_read_once: bool,
         stuck_high_after_shutdown: bool,
         pgood_pin_stuck_low: bool,
+        pgood_pin_stuck_high: bool,
     }
 
     impl FakeI2c {
@@ -501,6 +528,7 @@ mod tests {
                 fail_pgood_read_once: false,
                 stuck_high_after_shutdown: false,
                 pgood_pin_stuck_low: false,
+                pgood_pin_stuck_high: false,
             }
         }
 
@@ -575,7 +603,8 @@ mod tests {
                                 // Normally simulate the physical PGOOD output
                                 // tracking all-rail readiness.
                                 base | if !self.pgood_pin_stuck_low
-                                    && (self.pcal[PCAL_INPUT0 as usize] & PWR_GOOD_PIN != 0
+                                    && (self.pgood_pin_stuck_high
+                                        || self.pcal[PCAL_INPUT0 as usize] & PWR_GOOD_PIN != 0
                                         || self.pgood() == PGOOD_ALL_RAILS)
                                 {
                                     PWR_GOOD_PIN

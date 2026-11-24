@@ -686,7 +686,7 @@ mod tests {
         writes: Vec<(u8, u8, u8)>,
         rails_ready: Rc<Cell<bool>>,
         physical_pgood: Rc<Cell<Option<bool>>>,
-
+        trace: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
     impl FakeI2c {
         fn fresh() -> Self {
@@ -697,6 +697,7 @@ mod tests {
                 writes: Vec::new(),
                 rails_ready: Rc::new(Cell::new(false)),
                 physical_pgood: Rc::new(Cell::new(None)),
+                trace: None,
             };
             // All 16 expander pins are inputs at power-on.
             x.regs0[6] = 0xff;
@@ -730,6 +731,19 @@ mod tests {
                             register = first;
                             for &v in values {
                                 self.writes.push((addr, register, v));
+                                if let Some(trace) = &self.trace {
+                                    let previous = self.regs0[2];
+                                    let event = match (addr, register) {
+                                        (0x20, 2) if previous & 1 != 0 && v & 1 == 0 => "oe-low",
+                                        (0x20, 2) if previous & 0x20 != 0 && v & 0x20 == 0 => "vcom-low",
+                                        (0x20, 2) if previous & 0x10 != 0 && v & 0x10 == 0 => "pwrup-low",
+                                        (0x20, 2) if previous & 8 != 0 && v & 8 == 0 => "wakeup-low",
+                                        (0x20, 3) if v & 1 == 0 => "clock-gate-off",
+                                        (0x20, 6) if v & 7 == 7 => "expander-high-z",
+                                        _ => "other-write",
+                                    };
+                                    trace.borrow_mut().push(event);
+                                }
                                 if addr == 0x20 && register < 0x50 {
                                     self.regs0[usize::from(register)] = v;
                                     if self.regs0[2] & !self.regs0[6] & 0x08 == 0 {
@@ -1276,5 +1290,52 @@ mod tests {
         assert_eq!(b.pins.ckv.writes.len(), writes, "retry must not drive released pads");
     }
     run_both!(quiesce_failure_does_not_skip_power_or_high_z, quiesce_failure_does_not_skip_power_or_high_z_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn shutdown_order_and_uncertain_rail_containment_body() {
+        for pg_stuck_high in [false, true] {
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            let mut i2c = FakeI2c::fresh();
+            i2c.trace = Some(trace.clone());
+            let physical = i2c.physical_pgood.clone();
+            let mut b = bus_with_i2c(i2c);
+            b.prepare_low_voltage().await.unwrap();
+            b.power.enable().await.unwrap();
+            b.tx.trace = Some(trace.clone());
+            b.pins.le.trace = Some(trace.clone());
+            b.pins.ckv.trace = Some(trace.clone());
+            b.pins.sph.trace = Some(trace.clone());
+            trace.borrow_mut().clear();
+            if pg_stuck_high {
+                physical.set(Some(true));
+            }
+            let off = b.set_power(false).await;
+            let events = trace.borrow().clone();
+            let pos = |event| events.iter().position(|v| *v == event).unwrap();
+            assert!(pos("oe-low") < pos("clock-data-low"));
+            assert!(pos("clock-data-low") < pos("vcom-low"));
+            assert!(pos("vcom-low") < pos("pwrup-low"));
+            assert!(pos("pwrup-low") < pos("wakeup-low"));
+            assert!(pos("wakeup-low") < pos("clock-data-high-z"));
+            assert!(pos("clock-data-high-z") < pos("control-high-z"));
+            if pg_stuck_high {
+                assert!(off.is_err());
+                assert!(b.faulted);
+                assert!(!events.contains(&"expander-high-z"));
+                assert!(!events.contains(&"clock-gate-off"));
+                let snapshot = b.inspect().await.unwrap();
+                assert_eq!(snapshot.direction_port0 & 0x3f, 0);
+                assert_eq!(snapshot.output_port0 & 0x3f, 0);
+            } else {
+                off.unwrap();
+                assert!(pos("control-high-z") < pos("clock-gate-off"));
+                assert!(pos("clock-gate-off") < pos("expander-high-z"));
+            }
+        }
+    }
+    run_both!(shutdown_order_and_uncertain_rail_containment, shutdown_order_and_uncertain_rail_containment_body);
 
 }

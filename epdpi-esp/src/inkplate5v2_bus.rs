@@ -405,6 +405,8 @@ mod tests {
     use embedded_hal::digital::ErrorType as PinErrorType;
     use embedded_hal::i2c::{ErrorType as I2cErrorType, Error as I2cError, ErrorKind, Operation};
     use std::vec::Vec;
+    use std::rc::Rc;
+    use std::cell::RefCell;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct BusFault;
@@ -482,6 +484,8 @@ mod tests {
     #[derive(Default)]
     struct FakePin {
         writes: Vec<bool>,
+        name: &'static str,
+        trace: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
     impl PinErrorType for FakePin {
         type Error = Infallible;
@@ -489,10 +493,26 @@ mod tests {
     impl OutputPin for FakePin {
         fn set_low(&mut self) -> Result<(), Infallible> {
             self.writes.push(false);
+            if let Some(trace) = &self.trace {
+                let event = match self.name {
+                    "sph" => "sph-low",
+                    "ckv" => "ckv-low",
+                    _ => "le-low",
+                };
+                trace.borrow_mut().push(event);
+            }
             Ok(())
         }
         fn set_high(&mut self) -> Result<(), Infallible> {
             self.writes.push(true);
+            if let Some(trace) = &self.trace {
+                let event = match self.name {
+                    "sph" => "sph-high",
+                    "ckv" => "ckv-high",
+                    _ => "le-high",
+                };
+                trace.borrow_mut().push(event);
+            }
             Ok(())
         }
     }
@@ -502,6 +522,7 @@ mod tests {
         transmissions: usize,
         preparations: usize,
         prepared: bool,
+        trace: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),
@@ -512,12 +533,14 @@ mod tests {
         fn prepare_vendor_row(&mut self, _: &[u8]) -> Result<(), Self::Error> {
             self.preparations += 1;
             self.prepared = true;
+            if let Some(trace) = &self.trace { trace.borrow_mut().push("dma-prepared"); }
             Ok(())
         }
         async fn send_prepared_row(&mut self) -> Result<(), Self::Error> {
             assert!(self.prepared);
             self.prepared = false;
             self.transmissions += 1;
+            if let Some(trace) = &self.trace { trace.borrow_mut().push("dma-sent"); }
             Ok(())
         }
     }
@@ -591,4 +614,37 @@ mod tests {
         assert_eq!(i2c.regs0[7] & 0x01, 0);
     }
     run_both!(hardware_refresh_is_locked_even_after_preparation, hardware_refresh_is_locked_even_after_preparation_body);
+
+    // Exercise the internal sequencing helper in isolation, with a fake DMA
+    // sink and GPIO recorder. This does NOT bypass the public HV lock.
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn packs_before_sph_then_waits_for_dma_before_latch_body() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut b = bus();
+        b.tx.trace = Some(trace.clone());
+        b.pins.sph.name = "sph";
+        b.pins.ckv.name = "ckv";
+        b.pins.le.name = "le";
+        b.pins.sph.trace = Some(trace.clone());
+        b.pins.ckv.trace = Some(trace.clone());
+        b.pins.le.trace = Some(trace.clone());
+
+        // The helper is private and the public bus continues to reject
+        // power-on. Setting this test-only frame flag does not affect PMIC.
+        b.frame_open = true;
+        b.write_row_inner(&[0u8; INKPLATE5V2_ROW_BYTES]).await.unwrap();
+        b.next_row_inner().await.unwrap();
+        assert_eq!(*trace.borrow(), [
+            "dma-prepared", "sph-low", "ckv-high", "dma-sent",
+            "sph-high", "ckv-low", "le-high", "le-low",
+        ]);
+        assert_eq!(b.tx.preparations, 1);
+        assert_eq!(b.tx.transmissions, 1);
+        assert_eq!(b.power.state(), PowerState::Uninitialized);
+    }
+    run_both!(packs_before_sph_then_waits_for_dma_before_latch, packs_before_sph_then_waits_for_dma_before_latch_body);
+
 }

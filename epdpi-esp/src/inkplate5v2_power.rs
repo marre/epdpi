@@ -120,6 +120,8 @@ pub enum PowerError<E> {
     ClockNotEnabled,
     /// Clock enable state cannot be verified by register readback.
     ClockReadbackMismatch,
+    /// PMIC reports all rails ready but the separate physical PGOOD pin is low.
+    PhysicalPowerGoodLow,
 }
 
 /// Controls the PCAL6416A Port 0 power pins and TPS65186 high-voltage rails.
@@ -336,6 +338,12 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         for _ in 0..STARTUP_TIMEOUT_MS {
             last = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
             if last == PGOOD_ALL_RAILS {
+                // The PMIC status byte alone is not enough. The board also
+                // routes the physical PGOOD signal to expander P0.7.
+                // Refuse VCOM/OE if they disagree.
+                if !self.inspect_expander().await?.pgood_pin_high() {
+                    return Err(PowerError::PhysicalPowerGoodLow);
+                }
                 self.expander_levels(VCOM, VCOM).await?;
                 self.expander_levels(OE, OE).await?;
                 return Ok(());
@@ -447,6 +455,7 @@ mod tests {
         fail_sequence_write_once: bool,
         fail_pgood_read_once: bool,
         stuck_high_after_shutdown: bool,
+        pgood_pin_stuck_low: bool,
     }
 
     impl FakeI2c {
@@ -464,6 +473,7 @@ mod tests {
                 fail_sequence_write_once: false,
                 fail_pgood_read_once: false,
                 stuck_high_after_shutdown: false,
+                pgood_pin_stuck_low: false,
             }
         }
 
@@ -531,7 +541,16 @@ mod tests {
                             return Err(FakeError);
                         }
                         for byte in out.iter_mut() {
-                            let value = if addr == EXPANDER_ADDR {
+                            let value = if addr == EXPANDER_ADDR && register == PCAL_INPUT0 {
+                                let base = self.pcal[PCAL_INPUT0 as usize] & !PWR_GOOD_PIN;
+                                base | if self.pgood() == PGOOD_ALL_RAILS
+                                    && !self.pgood_pin_stuck_low
+                                {
+                                    PWR_GOOD_PIN
+                                } else {
+                                    0
+                                }
+                            } else if addr == EXPANDER_ADDR {
                                 self.pcal[register as usize]
                             } else if addr == PMIC_ADDR && register == PMIC_PWRGOOD {
                                 self.pgood()
@@ -857,4 +876,29 @@ mod tests {
         assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
     }
     run_test!(discharge_timeout_latches_fault, discharge_timeout_latches_fault_body);
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn physical_pgood_must_match_pmic_before_vcom_and_oe_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.pgood_pin_stuck_low = true;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        assert_eq!(power.enable().await, Err(PowerError::PhysicalPowerGoodLow));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & (OE | VCOM | PWRUP), 0);
+        assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
+        assert!(!i2c.events.iter().any(|e|
+            matches!(e, Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, bytes)
+                if bytes[0] & (OE | VCOM) != 0)
+        ));
+    }
+    run_test!(
+        physical_pgood_must_match_pmic_before_vcom_and_oe,
+        physical_pgood_must_match_pmic_before_vcom_and_oe_body
+    );
+
 }

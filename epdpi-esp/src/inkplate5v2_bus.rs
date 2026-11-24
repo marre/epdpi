@@ -363,7 +363,10 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         // deliberately latches faulted and invalidates the reusable bus.
         // Always request a PMIC shutdown even if one GPIO operation fails.
         let mut first_gpio_error = None;
-        if let Err(error) = self.pins.sph.set_high() {
+        // Match Soldered einkOff(): CKV/SPH/LE low before requesting
+        // PMIC shutdown. The direct GPIO high-Z step still requires
+        // board-specific pin-release support after rails are off.
+        if let Err(error) = self.pins.sph.set_low() {
             first_gpio_error = Some(error);
         }
         if let Err(error) = self.pins.ckv.set_low()

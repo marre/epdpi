@@ -490,7 +490,13 @@ mod tests {
                         }
                     }
                     Operation::Read(b) => for byte in b.iter_mut() {
-                        *byte = if addr == 0x20 && register < 8 {
+                        *byte = if addr == 0x20 && register == 0x00 {
+                            // The board routes physical PMIC PGOOD to P0.7.
+                            // Simulate that wire separately from status 0x0F.
+                            let powered = self.pmic_enable == 0x20
+                                && self.regs0[2] & 0x10 != 0;
+                            self.regs0[0] | if powered { 0x80 } else { 0 }
+                        } else if addr == 0x20 && register < 8 {
                             self.regs0[usize::from(register)]
                         } else if addr == 0x48 && register == 0x0f
                             && self.pmic_enable == 0x20

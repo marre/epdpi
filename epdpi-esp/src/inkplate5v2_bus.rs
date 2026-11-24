@@ -449,7 +449,7 @@ mod tests {
     use embedded_hal::i2c::{ErrorType as I2cErrorType, Error as I2cError, ErrorKind, Operation};
     use std::vec::Vec;
     use std::rc::Rc;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct BusFault;
@@ -462,6 +462,9 @@ mod tests {
         regs0: [u8; 8],
         pmic_enable: u8,
         writes: Vec<(u8, u8, u8)>,
+        rails_ready: Rc<Cell<bool>>,
+        physical_pgood: Rc<Cell<Option<bool>>>,
+
     }
     impl FakeI2c {
         fn fresh() -> Self {
@@ -471,6 +474,7 @@ mod tests {
             x.regs0[7] = 0xff;
             x.regs0[2] = 0xff;
             x.regs0[3] = 0xff;
+            x.rails_ready.set(true);
             x
         }
     }
@@ -509,13 +513,16 @@ mod tests {
                             // The board routes physical PMIC PGOOD to P0.7.
                             // Simulate that wire separately from status 0x0F.
                             let powered = self.pmic_enable == 0x20
-                                && self.regs0[2] & 0x10 != 0;
-                            self.regs0[0] | if powered { 0x80 } else { 0 }
+                                && self.regs0[2] & 0x10 != 0
+                                && self.rails_ready.get();
+                            let physical = self.physical_pgood.get().unwrap_or(powered);
+                            (self.regs0[0] & !0x80) | if physical { 0x80 } else { 0 }
                         } else if addr == 0x20 && register < 8 {
                             self.regs0[usize::from(register)]
                         } else if addr == 0x48 && register == 0x0f
                             && self.pmic_enable == 0x20
                             && self.regs0[2] & 0x10 != 0
+                            && self.rails_ready.get()
                         {
                             0xfa // The fake supplies all rails when the PMIC is enabled.
                         } else {
@@ -778,5 +785,70 @@ mod tests {
         assert!(matches!(second, Err(Inkplate5v2BusError::HardwareNotValidated)));
     }
     run_both!(normal_power_off_does_not_bypass_hv_lock, normal_power_off_does_not_bypass_hv_lock_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn refuses_next_frame_if_rails_drop_after_prior_success_body() {
+        let fake = FakeI2c::fresh();
+        let ready = fake.rails_ready.clone();
+        let mut b = bus_with_i2c(fake);
+        b.prepare_low_voltage().await.unwrap();
+        // Simulation-only: internal PMIC may be powered for tests, public
+        // set_power(true) remains permanently hardware-locked.
+        b.power.enable().await.unwrap();
+        b.start_frame().await.unwrap();
+        b.end_frame().await.unwrap();
+        let gpio_calls = b.pins.ckv.writes.len();
+        ready.set(false);
+        let result = b.start_frame().await;
+        assert!(matches!(
+            result,
+            Err(Inkplate5v2BusError::Power(PowerError::PowerGoodLost(0)))
+        ));
+        assert!(b.faulted);
+        assert_eq!(b.power.state(), PowerState::Faulted);
+        assert_eq!(b.tx.transmissions, 0);
+        // Only the emergency shutdown may touch GPIO after failed health.
+        // It must not enter the next vertical scan sequence.
+        assert_eq!(&b.pins.ckv.writes[gpio_calls..], &[false]);
+        let (tx, power, _) = b.release();
+        let (i2c, _) = power.release();
+        assert_eq!(tx.transmissions, 0);
+        assert_eq!(i2c.pmic_enable, 0);
+    }
+    run_both!(
+        refuses_next_frame_if_rails_drop_after_prior_success,
+        refuses_next_frame_if_rails_drop_after_prior_success_body
+    );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn refuses_next_frame_if_physical_pgood_drops_body() {
+        let fake = FakeI2c::fresh();
+        let physical = fake.physical_pgood.clone();
+        let mut b = bus_with_i2c(fake);
+        b.prepare_low_voltage().await.unwrap();
+        b.power.enable().await.unwrap();
+        physical.set(Some(false));
+        let result = b.start_frame().await;
+        assert!(matches!(
+            result,
+            Err(Inkplate5v2BusError::Power(PowerError::PhysicalPowerGoodLow))
+        ));
+        assert!(b.faulted);
+        assert_eq!(b.tx.transmissions, 0);
+        assert!(!b.frame_open);
+        // Force the mock physical input low but allow logical shutdown.
+        assert_eq!(b.power.state(), PowerState::Faulted);
+    }
+    run_both!(
+        refuses_next_frame_if_physical_pgood_drops,
+        refuses_next_frame_if_physical_pgood_drops_body
+    );
+
 
 }

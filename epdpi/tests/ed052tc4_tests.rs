@@ -22,6 +22,16 @@ const SOURCE: [[u8; 9]; 8] = [
 ];
 
 #[test]
+fn factory_vcom_is_not_guessed_for_ed052tc4() {
+    let mut prev = vec![0u8; P::FB_BYTES];
+    let mut line = vec![0u8; P::SCANLINE_BYTES];
+    let display = EpdDisplayBuilder::<P>::new()
+        .build(RecordingBus::default(), &mut prev, &mut line)
+        .unwrap();
+    assert_eq!(display.vcom_mv(), None, "factory VCOM must not be fabricated");
+}
+
+#[test]
 fn panel_geometry_and_grayscale_capabilities() {
     assert_eq!(P::WIDTH, 1280);
     assert_eq!(P::HEIGHT, 720);

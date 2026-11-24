@@ -878,4 +878,82 @@ mod tests {
     );
 
 
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn short_frame_fails_closed_without_declaring_success_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        b.power.enable().await.unwrap(); // test-only, public HV interlock unchanged
+        b.start_frame().await.unwrap();
+        let result = b.end_frame().await;
+        assert!(matches!(
+            result,
+            Err(Inkplate5v2BusError::FrameRowCount { expected: 720, actual: 0 })
+        ));
+        assert!(b.faulted);
+        assert_eq!(b.power.state(), PowerState::Faulted);
+        assert_eq!(b.tx.transmissions, 0);
+    }
+    run_both!(
+        short_frame_fails_closed_without_declaring_success,
+        short_frame_fails_closed_without_declaring_success_body
+    );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn extra_row_is_rejected_before_dma_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        b.power.enable().await.unwrap(); // test-only
+        b.start_frame().await.unwrap();
+        for _ in 0..INKPLATE5V2_ROWS {
+            b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await.unwrap();
+            b.next_row().await.unwrap();
+        }
+        let result = b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await;
+        assert!(matches!(
+            result,
+            Err(Inkplate5v2BusError::FrameRowCount { expected: 720, actual: 721 })
+        ));
+        assert!(b.faulted);
+        assert_eq!(b.tx.transmissions, INKPLATE5V2_ROWS);
+        assert_eq!(b.power.state(), PowerState::Faulted);
+    }
+    run_both!(extra_row_is_rejected_before_dma, extra_row_is_rejected_before_dma_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn exact_row_count_survives_multiple_complete_frames_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        b.power.enable().await.unwrap(); // test-only
+        for _ in 0..2 {
+            b.start_frame().await.unwrap();
+            for _ in 0..INKPLATE5V2_ROWS {
+                b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await.unwrap();
+                b.next_row().await.unwrap();
+            }
+            b.end_frame().await.unwrap();
+            assert_eq!(b.completed_rows, INKPLATE5V2_ROWS);
+            assert!(!b.frame_open);
+            assert!(!b.row_pending);
+        }
+        b.set_power(false).await.unwrap();
+        assert_eq!(b.power.state(), PowerState::Idle);
+        assert_eq!(b.completed_rows, 0);
+        assert!(!b.faulted);
+        assert_eq!(b.tx.transmissions, INKPLATE5V2_ROWS * 2);
+    }
+    run_both!(
+        exact_row_count_survives_multiple_complete_frames,
+        exact_row_count_survives_multiple_complete_frames_body
+    );
+
 }

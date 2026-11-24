@@ -1,0 +1,10 @@
+# The board is a classic ESP32 (Xtensa), not an ESP32-S3.
+# CI explicitly supplies the target to keep host-only checks independent.
+[target.xtensa-esp32-none-elf]
+rustflags = [
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+]
+
+[unstable]
+build-std = ["core", "alloc"]

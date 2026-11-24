@@ -585,14 +585,14 @@ async fn power_on_failure_attempts_shutdown_without_mutating_record_body() {
     let mut display = EpdDisplayBuilder::<P>::new()
         .build(FailPowerOnBus::default(), &mut prev, &mut scanline)
         .unwrap();
-    assert_eq!(display.refresh(&fb, RefreshMode::Quality16).await, Err("power-on failed"));
+    assert_eq!(display.refresh(&fb, RefreshMode::Quality16).await, Err(RefreshError::Bus("power-on failed")));
     assert_eq!(display.release().power_calls, [true, false]);
     assert!(prev.iter().all(|&b| b == 0xA5));
 
     let mut display = EpdDisplayBuilder::<P>::new()
         .build(FailPowerOnBus::default(), &mut prev, &mut scanline)
         .unwrap();
-    assert_eq!(display.clear().await, Err("power-on failed"));
+    assert_eq!(display.clear().await, Err(RefreshError::Bus("power-on failed")));
     assert_eq!(display.release().power_calls, [true, false]);
     assert!(prev.iter().all(|&b| b == 0xA5));
 }

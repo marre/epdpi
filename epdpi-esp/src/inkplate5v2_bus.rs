@@ -720,9 +720,11 @@ mod tests {
     async fn normal_power_off_does_not_bypass_hv_lock_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        assert!(matches!(b.set_power(true).await, Err(Inkplate5v2BusError::HardwareNotValidated)));
+        let first = b.set_power(true).await;
+        assert!(matches!(first, Err(Inkplate5v2BusError::HardwareNotValidated)));
         b.set_power(false).await.unwrap();
-        assert!(matches!(b.set_power(true).await, Err(Inkplate5v2BusError::HardwareNotValidated)));
+        let second = b.set_power(true).await;
+        assert!(matches!(second, Err(Inkplate5v2BusError::HardwareNotValidated)));
     }
     run_both!(normal_power_off_does_not_bypass_hv_lock, normal_power_off_does_not_bypass_hv_lock_body);
 

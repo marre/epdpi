@@ -160,6 +160,9 @@ Keep this branch as the integrated hardware-validation workspace ([PR #4](https:
 
 ## References
 
+- [Deep Research: ED052TC4 specifications, timing and library alternatives](inkplate5v2-research.md) — archived research; current decisions are recorded in this plan.
+
+
 - [Detailed current implementation and vendor timing differences](inkplate5v2-bringup.md)
 - [Flash backup and recovery procedure](inkplate5v2-recovery.md)
 - [Soldered Inkplate Arduino library](https://github.com/SolderedElectronics/Inkplate-Arduino-library)

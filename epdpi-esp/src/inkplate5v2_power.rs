@@ -36,8 +36,14 @@ const PCAL_CONFIG1: u8 = 0x07;
 const PMIC_ENABLE: u8 = 0x01;
 const PMIC_UPSEQ0: u8 = 0x09;
 const PMIC_DWNSEQ0: u8 = 0x0b;
+const PMIC_UPSEQ1: u8 = 0x0a;
+const PMIC_DWNSEQ1: u8 = 0x0c;
+const V3P3_ENABLE: u8 = 0x20;
+const HV_ENABLE_MASK: u8 = 0x1f;
 const PMIC_PWRGOOD: u8 = 0x0f;
 const PGOOD_ALL_RAILS: u8 = 0xfa;
+// TI SLVSB04A Fig. 2: at least 1.8 ms from WAKEUP to I2C readiness.
+const WAKE_DELAY_MS: u32 = 5;
 const STARTUP_TIMEOUT_MS: u16 = 500;
 const SHUTDOWN_TIMEOUT_MS: u16 = 250;
 
@@ -134,6 +140,10 @@ pub enum PowerError<E> {
     PowerGoodPinNotInput,
     /// PCAL readback did not confirm all panel control outputs inactive.
     LowVoltageReadbackMismatch,
+    /// The programmed PMIC sequencer did not read back correctly.
+    SequencerReadbackMismatch,
+    /// PMIC enable status does not match the expected state.
+    EnableReadbackMismatch(u8),
 }
 
 /// Controls the PCAL6416A Port 0 power pins and TPS65186 high-voltage rails.
@@ -252,7 +262,9 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         }
         // During a partially completed vendor power-on, WAKEUP, GMOD or
         // SPV can be asserted before OE/PWRUP/VCOM. None is safe to ignore.
-        if ((!snapshot.direction_port0) & snapshot.output_port0 & ALL_CONTROL) != 0 {
+        if (snapshot.input_port0 & ALL_CONTROL) != 0
+            || ((!snapshot.direction_port0) & snapshot.output_port0 & ALL_CONTROL) != 0
+        {
             return Err(PowerError::ActiveControlPins);
         }
         Ok(())
@@ -316,16 +328,16 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         self.write(EXPANDER_ADDR, PCAL_OUTPUT0, &[outputs & !ALL_CONTROL]).await?;
         self.write(EXPANDER_ADDR, PCAL_CONFIG0, &[direction & !ALL_CONTROL]).await?;
 
-        self.expander_levels(WAKEUP, WAKEUP).await?;
-        self.delay.delay_ms(1).await;
-        // Check PGOOD before writing PMIC sequencer registers. A nonzero
-        // value is an unexpected powered or partially powered condition.
-        let checked = match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
-            Ok(0) => self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0x1b, 0x00, 0x1b, 0x00]).await,
-            Ok(value) => Err(PowerError::RailsAlreadyOn(value)),
-            Err(err) => Err(err),
-        };
-        self.delay.delay_ms(1).await;
+        // An acknowledged direction/latch write is not proof of the actual
+        // pins. In particular WAKEUP rising with PWRUP high starts HV.
+        let idle = self.inspect_expander().await?;
+        Self::verify_initial_snapshot(idle)?;
+        if idle.direction_port0 & ALL_CONTROL != 0 {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        let checked = self.inspect_awake_idle().await;
+        // Even if WAKEUP assertion failed after reaching the expander,
+        // attempt to deassert it. Never access PMIC registers after sleep.
         let asleep = self.expander_levels(WAKEUP, 0).await;
         checked?;
         asleep?;
@@ -341,6 +353,22 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
             return Err(PowerError::LowVoltageReadbackMismatch);
         }
         self.state = PowerState::Idle;
+        Ok(())
+    }
+
+    async fn inspect_awake_idle(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        self.expander_levels(WAKEUP, WAKEUP).await?;
+        self.delay.delay_ms(WAKE_DELAY_MS).await;
+        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+        if pg != 0 {
+            return Err(PowerError::RailsAlreadyOn(pg));
+        }
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable != 0 {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
+        // SLEEP reloads factory defaults. Do not write volatile sequencing
+        // registers here only to lose them again when returning to sleep.
         Ok(())
     }
 
@@ -365,6 +393,14 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
                 return Err(error);
             }
         };
+        if let Err(error) = Self::verify_initial_snapshot(clock) {
+            self.state = PowerState::Faulted;
+            return Err(error);
+        }
+        if clock.direction_port0 & ALL_CONTROL != 0 {
+            self.state = PowerState::Faulted;
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
         if !clock.clock_enabled() {
             return Err(PowerError::ClockNotEnabled);
         }
@@ -384,10 +420,35 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         // Soldered's einkOn: GMOD/SPV high, OE low, before PMIC power-up.
         self.expander_levels(OE | GMOD | SPV | VCOM | PWRUP, GMOD | SPV).await?;
         self.expander_levels(WAKEUP, WAKEUP).await?;
-        self.delay.delay_ms(5).await;
-        self.write(PMIC_ADDR, PMIC_ENABLE, &[0x20]).await?;
-        self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0xe4]).await?;
-        self.write(PMIC_ADDR, PMIC_DWNSEQ0, &[0x1b]).await?;
+        self.delay.delay_ms(WAKE_DELAY_MS).await;
+        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+        if pg != 0 {
+            return Err(PowerError::RailsAlreadyOn(pg));
+        }
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable != 0 {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
+        // Preserve factory-loaded delay values. The vendor's begin() writes
+        // are lost in sleep; its effective active-cycle delays are the
+        // EEPROM defaults. Configure the active rail order on every wake.
+        let up_delay = self.read(PMIC_ADDR, PMIC_UPSEQ1).await?;
+        let down_delay = self.read(PMIC_ADDR, PMIC_DWNSEQ1).await?;
+        self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0xe4, up_delay]).await?;
+        self.write(PMIC_ADDR, PMIC_DWNSEQ0, &[0x1b, down_delay]).await?;
+        for (reg, expected) in [
+            (PMIC_UPSEQ0, 0xe4), (PMIC_UPSEQ1, up_delay),
+            (PMIC_DWNSEQ0, 0x1b), (PMIC_DWNSEQ1, down_delay),
+        ] {
+            if self.read(PMIC_ADDR, reg).await? != expected {
+                return Err(PowerError::SequencerReadbackMismatch);
+            }
+        }
+        self.write(PMIC_ADDR, PMIC_ENABLE, &[V3P3_ENABLE]).await?;
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable != V3P3_ENABLE {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
         self.expander_levels(PWRUP, PWRUP).await?;
 
         let mut last = 0;
@@ -397,9 +458,37 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
                 // Both independent indicators must agree; allow the PCAL
                 // input to settle until the bounded startup deadline rather
                 // than faulting on a transient disagreement.
-                if self.inspect_expander().await?.pgood_pin_high() {
+                let snapshot = self.inspect_expander().await?;
+                if snapshot.pgood_pin_high() {
+                    let expected = GMOD | SPV | WAKEUP | PWRUP;
+                    if snapshot.direction_port0 & ALL_CONTROL != 0
+                        || snapshot.direction_port0 & PWR_GOOD_PIN == 0
+                        || snapshot.input_port0 & ALL_CONTROL != expected
+                        || snapshot.output_port0 & ALL_CONTROL != expected
+                        || !snapshot.clock_enabled()
+                    {
+                        return Err(PowerError::PanelControlLost);
+                    }
                     self.expander_levels(VCOM, VCOM).await?;
+                    // Allow VCOM_CTRL deglitch (TI pin specification).
+                    self.delay.delay_ms(1).await;
+                    let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+                    if enable & (V3P3_ENABLE | HV_ENABLE_MASK)
+                        != V3P3_ENABLE | HV_ENABLE_MASK
+                    {
+                        return Err(PowerError::EnableReadbackMismatch(enable));
+                    }
+                    let bias = self.inspect_expander().await?;
+                    if bias.input_port0 & ALL_CONTROL != expected | VCOM
+                        || bias.output_port0 & ALL_CONTROL != expected | VCOM
+                        || bias.direction_port0 & ALL_CONTROL != 0
+                        || !bias.pgood_pin_high()
+                        || self.read(PMIC_ADDR, PMIC_PWRGOOD).await? != PGOOD_ALL_RAILS
+                    {
+                        return Err(PowerError::PanelControlLost);
+                    }
                     self.expander_levels(OE, OE).await?;
+                    self.verify_live_rails_inner().await?;
                     return Ok(());
                 }
             }
@@ -435,8 +524,13 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if !snapshot.pgood_pin_high() {
             return Err(PowerError::PhysicalPowerGoodLow);
         }
-        let active = OE | VCOM | PWRUP | GMOD | SPV;
-        if snapshot.direction_port0 & active != 0 || snapshot.output_port0 & active != active {
+        let active = ALL_CONTROL;
+        if snapshot.direction_port0 & active != 0
+            || snapshot.direction_port0 & PWR_GOOD_PIN == 0
+            || snapshot.output_port0 & active != active
+            || snapshot.input_port0 & active != active
+            || !snapshot.clock_enabled()
+        {
             return Err(PowerError::PanelControlLost);
         }
         Ok(())
@@ -455,13 +549,29 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if self.state == PowerState::Uninitialized {
             return Err(PowerError::InvalidState(self.state));
         }
+        let previously_faulted = self.state == PowerState::Faulted;
+        // Cancellation during shutdown must not leave a usable On state.
+        self.state = PowerState::Faulted;
         let result = self.shutdown_sequence().await;
-        if self.state != PowerState::Faulted && result.is_ok() {
+        if !previously_faulted && result.is_ok() {
             self.state = PowerState::Idle;
         } else {
             self.state = PowerState::Faulted;
         }
         result
+    }
+
+    async fn disable_logic_supply(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable & !V3P3_ENABLE != 0 {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
+        self.write(PMIC_ADDR, PMIC_ENABLE, &[0]).await?;
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable != 0 {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
+        Ok(())
     }
 
     async fn shutdown_sequence(&mut self) -> Result<(), PowerError<I2C::Error>> {
@@ -485,50 +595,87 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         let mut pgood = 0xff;
         let mut discharged = false;
         let mut physical_high = false;
-        for _ in 0..SHUTDOWN_TIMEOUT_MS {
-            match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
-                Ok(0) => {
-                    pgood = 0;
-                    match self.inspect_expander().await {
-                        Ok(snapshot) if !snapshot.pgood_pin_high() => {
-                            discharged = true;
-                            break;
-                        }
-                        Ok(_) => {
-                            physical_high = true;
-                            self.delay.delay_ms(1).await;
-                        }
-                        Err(e) => {
-                            if first.is_none() { first = Some(e); }
-                            break;
+        // A failed startup may never have woken the PMIC. Do not wake it
+        // just to shut down: WAKEUP rising with PWRUP high starts the rails.
+        let awake = match self.inspect_expander().await {
+            Ok(snapshot) => snapshot.input_port0 & WAKEUP != 0,
+            Err(e) => {
+                if first.is_none() { first = Some(e); }
+                false
+            }
+        };
+        if awake {
+            // A failed WAKEUP transaction may have asserted the pin just now.
+            self.delay.delay_ms(WAKE_DELAY_MS).await;
+            for _ in 0..SHUTDOWN_TIMEOUT_MS {
+                match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
+                    Ok(0) => {
+                        pgood = 0;
+                        match self.inspect_expander().await {
+                            Ok(snapshot) if !snapshot.pgood_pin_high() => {
+                                discharged = true;
+                                break;
+                            }
+                            Ok(_) => {
+                                physical_high = true;
+                                self.delay.delay_ms(1).await;
+                            }
+                            Err(e) => {
+                                if first.is_none() { first = Some(e); }
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(value) => { pgood = value; self.delay.delay_ms(1).await; }
-                Err(e) => {
-                    if first.is_none() { first = Some(e); }
-                    break;
+                    Ok(value) => { pgood = value; self.delay.delay_ms(1).await; }
+                    Err(e) => {
+                        if first.is_none() { first = Some(e); }
+                        break;
+                    }
                 }
             }
+            if !discharged && first.is_none() {
+                first = if physical_high && pgood == 0 {
+                    Some(PowerError::PhysicalPowerGoodStillHigh)
+                } else {
+                    Some(PowerError::DischargeTimeout(pgood))
+                };
+            }
+            // ENABLE bits reflect actual rail state. Never clear individual
+            // HV bits while a sequenced shutdown may still be in progress.
+            if discharged {
+                let disabled = self.disable_logic_supply().await;
+                if let Err(e) = disabled
+                    && first.is_none()
+                {
+                    first = Some(e);
+                }
+            }
+        } else if first.is_none() {
+            // PMIC already asleep: internal status is unavailable. Never
+            // report this as a verified healthy shutdown.
+            first = Some(PowerError::PanelControlLost);
         }
-        if !discharged && first.is_none() {
-            first = if physical_high && pgood == 0 {
-                Some(PowerError::PhysicalPowerGoodStillHigh)
-            } else {
-                Some(PowerError::DischargeTimeout(pgood))
-            };
-        }
-        // Match Soldered TPS65186::powerDown(): drop WAKEUP first, then
-        // write ENABLE=0. Continue both attempts even if one fails.
+        // WAKEUP low requests sequenced power-down even on PG/I2C failure.
         if let Err(e) = self.expander_levels(WAKEUP, 0).await
             && first.is_none()
         {
             first = Some(e);
         }
-        if let Err(e) = self.write(PMIC_ADDR, PMIC_ENABLE, &[0]).await
-            && first.is_none()
-        {
-            first = Some(e);
+        // PG=0 is not a measurement of zero volts. Allow the final discharge
+        // interval shown in TI Fig. 2 before a healthy cycle may restart.
+        self.delay.delay_ms(50).await;
+        match self.inspect_expander().await {
+            Ok(snapshot) => {
+                if (snapshot.input_port0 & ALL_CONTROL != 0
+                    || snapshot.output_port0 & ALL_CONTROL != 0
+                    || snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN
+                    || snapshot.pgood_pin_high())
+                    && first.is_none()
+                {
+                    first = Some(PowerError::PanelControlLost);
+                }
+            }
+            Err(e) => if first.is_none() { first = Some(e); },
         }
         if let Some(e) = first { Err(e) } else { Ok(()) }
     }
@@ -582,7 +729,7 @@ mod tests {
             pcal[PCAL_OUTPUT1 as usize] = 0xff;
             Self {
                 pcal,
-                pmic: [0u8; 16],
+                pmic: Self::sleep_defaults(),
                 events: Vec::new(),
                 rails_ready: true,
                 fail_sequence_write_once: false,
@@ -597,12 +744,24 @@ mod tests {
             }
         }
 
+        fn sleep_defaults() -> [u8; 16] {
+            let mut registers = [0; 16];
+            registers[PMIC_UPSEQ1 as usize] = 0x55;
+            registers[PMIC_DWNSEQ1 as usize] = 0x20;
+            registers
+        }
+
+        fn physical_controls(&self) -> u8 {
+            // Model pull-downs on input pins and physical output levels.
+            self.pcal[PCAL_OUTPUT0 as usize] & !self.pcal[PCAL_CONFIG0 as usize] & ALL_CONTROL
+        }
+
         fn pgood(&self) -> u8 {
             if self.stuck_high_after_shutdown {
                 return PGOOD_ALL_RAILS;
             }
             if self.rails_ready
-                && self.pcal[PCAL_OUTPUT0 as usize] & PWRUP != 0
+                && self.physical_controls() & (PWRUP | WAKEUP) == PWRUP | WAKEUP
                 && self.pmic[PMIC_ENABLE as usize] == 0x20
             {
                 PGOOD_ALL_RAILS
@@ -626,6 +785,9 @@ mod tests {
             addr: u8,
             operations: &mut [Operation<'_>],
         ) -> Result<(), Self::Error> {
+            if addr == PMIC_ADDR && self.physical_controls() & WAKEUP == 0 {
+                return Err(FakeError);
+            }
             let mut register = 0;
             for operation in operations {
                 match operation {
@@ -652,7 +814,11 @@ mod tests {
                                             self.ignore_config0_write_once = false;
                                             continue; // Simulate an ACKed write the chip did not latch.
                                         }
+                                        let was_awake = self.physical_controls() & WAKEUP != 0;
                                         self.pcal[index] = *value;
+                                        if was_awake && self.physical_controls() & WAKEUP == 0 {
+                                            self.pmic = Self::sleep_defaults();
+                                        }
                                     } else if addr == PMIC_ADDR {
                                         self.pmic[index] = *value;
                                     } else {
@@ -675,7 +841,8 @@ mod tests {
                         }
                         for byte in out.iter_mut() {
                             let value = if addr == EXPANDER_ADDR && register == PCAL_INPUT0 {
-                                let base = self.pcal[PCAL_INPUT0 as usize] & !PWR_GOOD_PIN;
+                                let base = (self.pcal[PCAL_INPUT0 as usize] & !PWR_GOOD_PIN)
+                                    | self.physical_controls();
                                 // The pin can be asserted independently
                                 // of PMIC register state in a read-only test.
                                 // Normally simulate the physical PGOOD output
@@ -691,6 +858,11 @@ mod tests {
                                 }
                             } else if addr == EXPANDER_ADDR {
                                 self.pcal[register as usize]
+                            } else if addr == PMIC_ADDR && register == PMIC_ENABLE {
+                                let controls = self.physical_controls();
+                                self.pmic[PMIC_ENABLE as usize]
+                                    | if controls & PWRUP != 0 { 0x0f } else { 0 }
+                                    | if controls & VCOM != 0 { 0x10 } else { 0 }
                             } else if addr == PMIC_ADDR && register == PMIC_PWRGOOD {
                                 self.pgood()
                             } else if addr == PMIC_ADDR {
@@ -752,10 +924,8 @@ mod tests {
         let (i2c, _) = power.release();
         assert_eq!(i2c.pcal[PCAL_CONFIG0 as usize] & ALL_CONTROL, 0);
         assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
-        assert_eq!(i2c.pmic[PMIC_UPSEQ0 as usize], 0x1b);
-        assert_eq!(i2c.pmic[(PMIC_UPSEQ0 + 1) as usize], 0x00);
-        assert_eq!(i2c.pmic[PMIC_DWNSEQ0 as usize], 0x1b);
-        assert_eq!(i2c.pmic[(PMIC_DWNSEQ0 + 1) as usize], 0x00);
+        assert_eq!(i2c.pmic, FakeI2c::sleep_defaults());
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(PMIC_ADDR, _, _))));
         assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0x00);
     }
     run_test!(starts_without_activating_rails, starts_without_activating_rails_body);
@@ -928,7 +1098,7 @@ mod tests {
                 if bytes[0] & OE != 0)
         ).unwrap();
         assert!(good_index < vcom_index && vcom_index < oe_index);
-        assert!(delay.total_ns >= 7_000_000);
+        assert!(delay.total_ns >= 11_000_000);
         assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, ALL_CONTROL);
         // Keep variables accessible for completeness.
         i2c.events.clear();
@@ -997,7 +1167,7 @@ mod tests {
         let rails_disabled = i2c.events.iter().rposition(|e|
             matches!(e, Event::Write(PMIC_ADDR, PMIC_ENABLE, bytes) if bytes[0] == 0)
         ).unwrap();
-        assert!(wakeup_low < rails_disabled);
+        assert!(rails_disabled < wakeup_low);
         assert!(i2c.events.iter().any(|e|
             matches!(e, Event::Read(PMIC_ADDR, PMIC_PWRGOOD, 0))
         ));
@@ -1248,5 +1418,44 @@ mod tests {
         physical_pgood_stuck_high_after_pmic_shutdown_latches_fault,
         physical_pgood_stuck_high_after_pmic_shutdown_latches_fault_body
     );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn sleeping_pmic_rejects_i2c_and_factory_delays_survive_cycles_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        assert_eq!(power.read(PMIC_ADDR, PMIC_ENABLE).await, Err(PowerError::I2c(FakeError)));
+        power.configure_clock_gate().await.unwrap();
+        for _ in 0..2 {
+            power.enable().await.unwrap();
+            assert_eq!(power.read(PMIC_ADDR, PMIC_UPSEQ0).await.unwrap(), 0xe4);
+            assert_eq!(power.read(PMIC_ADDR, PMIC_UPSEQ1).await.unwrap(), 0x55);
+            assert_eq!(power.read(PMIC_ADDR, PMIC_DWNSEQ0).await.unwrap(), 0x1b);
+            assert_eq!(power.read(PMIC_ADDR, PMIC_DWNSEQ1).await.unwrap(), 0x20);
+            power.disable().await.unwrap();
+            assert_eq!(power.state(), PowerState::Idle);
+            assert_eq!(power.read(PMIC_ADDR, PMIC_ENABLE).await, Err(PowerError::I2c(FakeError)));
+        }
+    }
+    run_test!(sleeping_pmic_rejects_i2c_and_factory_delays_survive_cycles,
+        sleeping_pmic_rejects_i2c_and_factory_delays_survive_cycles_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn physical_pwrup_high_with_low_latch_blocks_wake_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.i2c.pcal[PCAL_INPUT0 as usize] |= PWRUP;
+        assert_eq!(power.enable().await, Err(PowerError::ActiveControlPins));
+        assert_eq!(power.state(), PowerState::Faulted);
+        assert_eq!(power.i2c.physical_controls() & WAKEUP, 0);
+    }
+    run_test!(physical_pwrup_high_with_low_latch_blocks_wake,
+        physical_pwrup_high_with_low_latch_blocks_wake_body);
 
 }

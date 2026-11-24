@@ -486,6 +486,7 @@ mod tests {
     struct FakeI2c {
         regs0: [u8; 8],
         pmic_enable: u8,
+        pmic_registers: [u8; 16],
         writes: Vec<(u8, u8, u8)>,
         rails_ready: Rc<Cell<bool>>,
         physical_pgood: Rc<Cell<Option<bool>>>,
@@ -515,6 +516,9 @@ mod tests {
             addr: u8,
             operations: &mut [Operation<'_>],
         ) -> Result<(), BusFault> {
+            if addr == 0x48 && self.regs0[2] & !self.regs0[6] & 0x08 == 0 {
+                return Err(BusFault);
+            }
             let mut register = 0;
             for op in operations {
                 match op {
@@ -525,9 +529,16 @@ mod tests {
                                 self.writes.push((addr, register, v));
                                 if addr == 0x20 && register < 8 {
                                     self.regs0[usize::from(register)] = v;
+                                    if self.regs0[2] & !self.regs0[6] & 0x08 == 0 {
+                                        self.pmic_enable = 0;
+                                        self.pmic_registers = [0; 16];
+                                    }
                                 }
-                                if addr == 0x48 && register == 0x01 {
-                                    self.pmic_enable = v;
+                                if addr == 0x48 {
+                                    self.pmic_registers[usize::from(register)] = v;
+                                    if register == 0x01 {
+                                        self.pmic_enable = v;
+                                    }
                                 }
                                 register += 1;
                             }
@@ -541,7 +552,8 @@ mod tests {
                                 && self.regs0[2] & 0x10 != 0
                                 && self.rails_ready.get();
                             let physical = self.physical_pgood.get().unwrap_or(powered);
-                            (self.regs0[0] & !0x80) | if physical { 0x80 } else { 0 }
+                            (self.regs0[0] & !0x80) | (self.regs0[2] & !self.regs0[6] & 0x3f)
+                                | if physical { 0x80 } else { 0 }
                         } else if addr == 0x20 && register < 8 {
                             self.regs0[usize::from(register)]
                         } else if addr == 0x48 && register == 0x0f
@@ -550,8 +562,15 @@ mod tests {
                             && self.rails_ready.get()
                         {
                             0xfa // The fake supplies all rails when the PMIC is enabled.
+                        } else if addr == 0x48 && register == 0x01 {
+                            let controls = self.regs0[2] & !self.regs0[6];
+                            self.pmic_enable
+                                | if controls & 0x10 != 0 { 0x0f } else { 0 }
+                                | if controls & 0x20 != 0 { 0x10 } else { 0 }
+                        } else if addr == 0x48 && register < 16 && register != 0x0f {
+                            self.pmic_registers[usize::from(register)]
                         } else {
-                            0 // Other unmodeled PMIC registers read zero.
+                            0
                         };
                         register += 1;
                     },

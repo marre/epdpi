@@ -49,7 +49,7 @@ pub mod waveform;
 
 pub use crate::bus::{ControlPins, GenericGpioBus};
 pub use crate::driver::{EpdDisplay, EpdDisplayBuilder};
-pub use crate::error::ValidationError;
+pub use crate::error::{RefreshError, ValidationError};
 pub use crate::graphics::{EpdFrameBuffer, Rect, Rotation};
 pub use crate::panels::{
     ED047TC1_LUT, ED052TC4_LUT, Ed047tc1, Ed052tc4, M5_ERASER_LUT, M5_FAST_LUT, M5_FASTEST_LUT,

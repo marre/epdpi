@@ -104,8 +104,16 @@ pub async fn row_end<S: Inkplate5v2Signals>(
 ) -> Result<(), S::Error> {
     pins.set_sph(true).await?;
     pins.set_ckv(false).await?;
+    // ED052TC4 specifies XLE turn-on delay, at least 300 ns XLE high,
+    // and an off delay before the next row. GPIO writes alone cannot
+    // establish these minima. One microsecond gives a conservative
+    // software-side margin without requiring cycle-accurate calibration.
+    pins.busy_wait_us(1);
     pins.set_le(true).await?;
-    pins.set_le(false).await
+    pins.busy_wait_us(1);
+    pins.set_le(false).await?;
+    pins.busy_wait_us(1);
+    Ok(())
 }
 
 /// Vendor inter-pass settle delay following the final row latch.
@@ -201,8 +209,9 @@ mod tests {
             Event::Ckv(false), Event::Ckv(true), Event::Wait(18),
             Event::Ckv(false), Event::Ckv(true),
             Event::Sph(false), Event::Ckv(true),
-            Event::Sph(true), Event::Ckv(false), Event::Le(true),
-            Event::Le(false), Event::Wait(230),
+            Event::Sph(true), Event::Ckv(false), Event::Wait(1),
+            Event::Le(true), Event::Wait(1),
+            Event::Le(false), Event::Wait(1), Event::Wait(230),
         ]);
     }
     both_modes!(vendor_frame_and_row_edges, vendor_frame_and_row_edges_body);

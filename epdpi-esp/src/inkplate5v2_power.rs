@@ -543,8 +543,13 @@ mod tests {
                         for byte in out.iter_mut() {
                             let value = if addr == EXPANDER_ADDR && register == PCAL_INPUT0 {
                                 let base = self.pcal[PCAL_INPUT0 as usize] & !PWR_GOOD_PIN;
-                                base | if self.pgood() == PGOOD_ALL_RAILS
-                                    && !self.pgood_pin_stuck_low
+                                // The pin can be asserted independently
+                                // of PMIC register state in a read-only test.
+                                // Normally simulate the physical PGOOD output
+                                // tracking all-rail readiness.
+                                base | if !self.pgood_pin_stuck_low
+                                    && (self.pcal[PCAL_INPUT0 as usize] & PWR_GOOD_PIN != 0
+                                        || self.pgood() == PGOOD_ALL_RAILS)
                                 {
                                     PWR_GOOD_PIN
                                 } else {

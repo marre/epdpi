@@ -244,7 +244,9 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if snapshot.pgood_pin_high() {
             return Err(PowerError::PhysicalPowerGoodAlreadyHigh);
         }
-        if ((!snapshot.direction_port0) & snapshot.output_port0 & (OE | PWRUP | VCOM)) != 0 {
+        // During a partially completed vendor power-on, WAKEUP, GMOD or
+        // SPV can be asserted before OE/PWRUP/VCOM. None is safe to ignore.
+        if ((!snapshot.direction_port0) & snapshot.output_port0 & ALL_CONTROL) != 0 {
             return Err(PowerError::ActiveControlPins);
         }
         Ok(())

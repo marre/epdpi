@@ -26,7 +26,19 @@ PMIC configuration, so it is not a substitute for read-only diagnostics.
 The UART is the board's CH340C serial bridge. A 5-second snapshot shows
 PCAL input/output levels and configurations, including P0.7 PGOOD and
 P1.0 GPIO0 clock-enable state. The logic readback is **not** a voltage
-measurement. A failed low-voltage setup halts rather than retries.
+measurement.
+
+The opt-in build performs a **read-only preflight before configuring any
+display control outputs or I2S pins**. It rejects asserted physical PGOOD,
+an incorrectly configured PGOOD input, or an actively driven PCAL power/control
+output (including WAKEUP, GMOD and SPV). Its board library repeats that check
+before changing direct GPIO. A failed setup halts rather than retrying.
+
+**Unresolved before activating display high voltage:** the HAL's I2S
+`send()` start code still has unbounded waits (only transfer completion is
+now time-limited), and source/clock/data high-Z shutdown is not fully
+implemented. These are documented in the
+[second-pass review](../../docs/inkplate5v2-second-pass-review.md).
 
 ## Design notes
 

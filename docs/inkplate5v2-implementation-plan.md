@@ -2,6 +2,13 @@
 
 _Last revised: 2026-11-24. Working branch: `integration/inkplate-5v2-bringup`._
 
+## Implementation progress (2026-11-24)
+
+- **Software milestone reached:** [`firmware/inkplate5v2-bringup`](../firmware/inkplate5v2-bringup/README.md) builds a complete classic ESP32 binary linked to the actual `epdpi-esp` board stack. The default mode performs read-only PCAL inspections. An explicitly compiled `low-voltage-prep` mode initializes the direct control pins, I2S1 DMA routing and the PMIC sequencer while leaving panel high voltage locked.
+- **CI verified:** [HV-locked firmware build](https://github.com/marre/epdpi/actions/runs/45447718321) passed both build modes and the independent first-stage diagnostic build.
+- **Not yet performed:** Flash backup/recovery on the owner's device, first diagnostic execution, on-device low-voltage preparation, electrical verification or visible display updates. `set_power(true)` still returns `HardwareNotValidated` and neither new firmware mode sends a scanline.
+- **Next parallel work:** Finish the targeted I2S/waveform protocol audit in Phase 3 while the hardware owner completes Phase 1's recovery prerequisites. The first high-voltage test is a later, separately reviewed milestone.
+
 ## Goal and constraints
 
 Build a reliable Rust driver for the **Soldered Inkplate 5 Gen 2** (ED052TC4, 1280 × 720 landscape, classic ESP32 WROVER-E), using the existing `epdpi` integration branch.
@@ -148,7 +155,7 @@ After stable full grayscale support:
 | F (P1) | Reliability campaign and documented limitations | E |
 | G (P2) | Partial refresh and measured optimization | F |
 
-**First development task:** **B — finish real board integration** in `epdpi-esp` plus minimal device firmware. In parallel, perform C's targeted software audit. Do **not** start with a custom DMA implementation.
+**Current software milestone:** The minimal HV-locked firmware and board binding build successfully. Next: complete **C — targeted existing I2S/packing/waveform audit**, then use the recoverable physical board for read-only diagnostics and low-voltage preparation. Do **not** start with a custom DMA implementation.
 
 ## When to revisit SPH/DMA timing
 

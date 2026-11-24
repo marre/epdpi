@@ -965,10 +965,9 @@ mod tests {
         // In the timed fixture, PG may be gone well before the remaining
         // enables clear. This tests shutdown ordering, not analogue voltage.
         fn hv_enables(&self) -> u8 {
-            if self.physical_controls() & PWRUP != 0 {
-                0x0f
-            } else if self.clock.is_some()
-                && self.rail_stopped_ns.is_some_and(|time| self.now_ns() - time < 300_000_000)
+            if self.physical_controls() & PWRUP != 0
+                || (self.clock.is_some()
+                    && self.rail_stopped_ns.is_some_and(|time| self.now_ns() - time < 300_000_000))
             {
                 0x0f
             } else {
@@ -1851,5 +1850,26 @@ mod tests {
         assert_eq!(power.i2c.physical_controls(), 0);
         assert_eq!(power.state(), PowerState::Faulted);
     }
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn unsafe_vcom_modes_prevent_rail_startup_body() {
+        for mode in [0x20, 0x40, 0x80] {
+            let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+            power.initialize().await.unwrap();
+            power.configure_clock_gate().await.unwrap();
+            power.i2c.pmic[PMIC_VCOM2 as usize] = mode;
+            assert_eq!(power.enable().await, Err(PowerError::InvalidVcomMode(mode)));
+            assert_eq!(power.state(), PowerState::Faulted);
+            assert_eq!(power.i2c.physical_controls(), 0);
+            assert!(!power.i2c.events.iter().any(|e|
+                matches!(e, Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, bytes)
+                    if bytes[0] & PWRUP != 0)
+            ));
+        }
+    }
+    run_test!(unsafe_vcom_modes_prevent_rail_startup, unsafe_vcom_modes_prevent_rail_startup_body);
 
 }

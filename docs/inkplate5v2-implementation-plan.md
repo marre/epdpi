@@ -18,6 +18,16 @@ The [independent second-pass review](inkplate5v2-second-pass-review.md) found ad
 - **Still unverified:** actual GPIO0 pixel clock versus vendor BCK routing, source-latch window, physical rail behavior and ED052TC4 image quality. The existing firmware is intentionally non-driving.
 - The physical backup, ROM recovery and first-stage diagnostic remain prerequisites. No on-device observations were obtained during this review.
 
+## Third-pass review: live-state validation (2026-11-24)
+
+The [third independent source review](inkplate5v2-third-pass-review.md) challenged the assumption that a successful power-up remained valid throughout a multi-pass refresh.
+
+- **Fixed:** Check TPS65186 power-good, physical PCAL P0.7 PGOOD, and all expected OE/VCOM/PWRUP/GMOD/SPV control outputs **before every new frame**. Fail closed and request shutdown if they disagree.
+- **Fixed:** An I²C failure checking the clock gate before power-on now latches `Faulted` instead of allowing immediate retry.
+- **Fixed:** Low-voltage initialization now reads back PCAL output and direction registers before marking the device `Idle`, including a test for an acknowledged write that was ignored.
+- **Expanded test campaign:** Inject failure at each of the eight register writes during PMIC power-up and verify that the shutdown path is attempted without leaving OE/VCOM/PWRUP asserted.
+- **Still not sufficient to unlock HV:** unbounded HAL *start* waits, incomplete high-Z cleanup, and physical timing/rail uncertainty remain open. The status checks cannot catch a rail failure occurring in the middle of a scanline.
+
 ## Goal and constraints
 
 Build a reliable Rust driver for the **Soldered Inkplate 5 Gen 2** (ED052TC4, 1280 × 720 landscape, classic ESP32 WROVER-E), using the existing `epdpi` integration branch.

@@ -121,6 +121,17 @@ fn main() -> ! {
             }
         };
         log_snapshot(initial);
+        // A diagnostic readout alone is not permission to drive GPIO0, CKV,
+        // SPH or LE. Abort before even constructing the I2S pin matrix if
+        // the panel may be on, the physical PGOOD input is misconfigured,
+        // or any power control output is asserted.
+        if let Err(error) = power.preflight_low_voltage() {
+            esp_println::println!(
+                "Unsafe low-voltage entry: {error:?}. No display GPIO or I2S configured."
+            );
+            loop { core::hint::spin_loop(); }
+        }
+        esp_println::println!("Read-only power-entry preflight passed.");
 
         // Direct control pins are brought to the manufacturer's idle levels
         // *before* I2S is attached to GPIO0 and before PMIC setup.

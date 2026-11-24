@@ -1217,8 +1217,8 @@ mod tests {
         b.power.enable().await.unwrap(); // test only
         b.start_frame().await.unwrap();
         b.tx.fail_send = true;
-        assert!(matches!(b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await,
-            Err(Inkplate5v2BusError::Dma(BusFault))));
+        let failed = b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await;
+        assert!(matches!(failed, Err(Inkplate5v2BusError::Dma(BusFault))));
         assert!(b.faulted);
         assert!(b.tx.released);
         assert!(b.pins.le.released && b.pins.ckv.released && b.pins.sph.released);
@@ -1226,7 +1226,8 @@ mod tests {
         assert_eq!(snapshot.direction_port0 & 0x3f, 7);
         assert!(!snapshot.clock_enabled());
         assert!(!snapshot.pgood_pin_high());
-        assert!(matches!(b.start_frame().await, Err(Inkplate5v2BusError::Faulted)));
+        let next = b.start_frame().await;
+        assert!(matches!(next, Err(Inkplate5v2BusError::Faulted)));
     }
     run_both!(dma_failure_releases_all_panel_pins, dma_failure_releases_all_panel_pins_body);
 
@@ -1239,7 +1240,8 @@ mod tests {
         b.prepare_low_voltage().await.unwrap();
         b.power.enable().await.unwrap();
         b.tx.fail_quiesce = true;
-        assert!(matches!(b.set_power(false).await, Err(Inkplate5v2BusError::Dma(BusFault))));
+        let off = b.set_power(false).await;
+        assert!(matches!(off, Err(Inkplate5v2BusError::Dma(BusFault))));
         assert!(b.faulted);
         assert!(b.tx.released);
         assert!(b.pins.le.released && b.pins.ckv.released && b.pins.sph.released);

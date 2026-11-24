@@ -403,6 +403,14 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
 
     async fn start_frame(&mut self) -> Result<(), Self::Error> {
         self.require_ready().await?;
+        // PowerState::On is only a cached fact from the initial ramp. Check
+        // both PGOOD sources and the actual output latches before *each*
+        // vertical scan; do not drive another frame after rails disappear.
+        let health = self.power.verify_live_rails().await.map_err(Inkplate5v2BusError::Power);
+        if health.is_err() {
+            self.emergency_off().await;
+            return health;
+        }
         let result = self.start_frame_inner().await;
         if result.is_err() { self.emergency_off().await; }
         result

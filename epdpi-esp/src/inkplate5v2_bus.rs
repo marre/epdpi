@@ -358,12 +358,40 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         if self.power.state() == PowerState::Uninitialized {
             return Ok(());
         }
-        self.emergency_off().await;
-        if self.power.state() == PowerState::Faulted {
-            Err(Inkplate5v2BusError::Faulted)
-        } else {
-            Ok(())
+        // A successful refresh must be allowed to power down and refresh
+        // again. Do not use emergency_off() for an ordinary shutdown: it
+        // deliberately latches faulted and invalidates the reusable bus.
+        // Always request a PMIC shutdown even if one GPIO operation fails.
+        let mut first_gpio_error = None;
+        if let Err(error) = self.pins.sph.set_high() {
+            first_gpio_error = Some(error);
         }
+        if let Err(error) = self.pins.ckv.set_low()
+            && first_gpio_error.is_none()
+        {
+            first_gpio_error = Some(error);
+        }
+        if let Err(error) = self.pins.le.set_low()
+            && first_gpio_error.is_none()
+        {
+            first_gpio_error = Some(error);
+        }
+
+        let off = self.power.disable().await;
+        self.frame_open = false;
+        self.row_pending = false;
+        if let Some(error) = first_gpio_error {
+            self.faulted = true;
+            return Err(Inkplate5v2BusError::Gpio(error));
+        }
+        if let Err(error) = off {
+            self.faulted = true;
+            return Err(Inkplate5v2BusError::Power(error));
+        }
+        if self.faulted || self.power.state() == PowerState::Faulted {
+            return Err(Inkplate5v2BusError::Faulted);
+        }
+        Ok(())
     }
 
     async fn start_frame(&mut self) -> Result<(), Self::Error> {

@@ -132,6 +132,8 @@ pub enum PowerError<E> {
     PhysicalPowerGoodAlreadyHigh,
     /// Expander P0.7 must be configured as an input to observe PGOOD.
     PowerGoodPinNotInput,
+    /// PCAL readback did not confirm all panel control outputs inactive.
+    LowVoltageReadbackMismatch,
 }
 
 /// Controls the PCAL6416A Port 0 power pins and TPS65186 high-voltage rails.
@@ -327,6 +329,17 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         let asleep = self.expander_levels(WAKEUP, 0).await;
         checked?;
         asleep?;
+        // A successful I2C ACK is not proof the configuration latched.
+        // Before declaring the board idle, check that power-control
+        // outputs really are low, configured as outputs, and PGOOD is low.
+        let idle = self.inspect_expander().await?;
+        if idle.output_port0 & ALL_CONTROL != 0
+            || idle.direction_port0 & ALL_CONTROL != 0
+            || idle.direction_port0 & PWR_GOOD_PIN == 0
+            || idle.pgood_pin_high()
+        {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
         self.state = PowerState::Idle;
         Ok(())
     }
@@ -554,6 +567,7 @@ mod tests {
         write_attempts: usize,
         fail_pgood_read_once: bool,
         fail_expander_read_once: bool,
+        ignore_config0_write_once: bool,
         stuck_high_after_shutdown: bool,
         pgood_pin_stuck_low: bool,
         pgood_pin_stuck_high: bool,
@@ -576,6 +590,7 @@ mod tests {
                 write_attempts: 0,
                 fail_pgood_read_once: false,
                 fail_expander_read_once: false,
+                ignore_config0_write_once: false,
                 stuck_high_after_shutdown: false,
                 pgood_pin_stuck_low: false,
                 pgood_pin_stuck_high: false,
@@ -633,6 +648,10 @@ mod tests {
                                 for (offset, value) in tail.iter().enumerate() {
                                     let index = register as usize + offset;
                                     if addr == EXPANDER_ADDR {
+                                        if register == PCAL_CONFIG0 && self.ignore_config0_write_once {
+                                            self.ignore_config0_write_once = false;
+                                            continue; // Simulate an ACKed write the chip did not latch.
+                                        }
                                         self.pcal[index] = *value;
                                     } else if addr == PMIC_ADDR {
                                         self.pmic[index] = *value;
@@ -740,6 +759,29 @@ mod tests {
         assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0x00);
     }
     run_test!(starts_without_activating_rails, starts_without_activating_rails_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn acked_but_ignored_pcal_direction_write_must_fault_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.ignore_config0_write_once = true;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        assert_eq!(power.initialize().await, Err(PowerError::LowVoltageReadbackMismatch));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        // Data pins are still high-Z. Do not mistake this for an initialized
+        // board and allow a power-on with incorrectly configured OE/PWRUP.
+        assert_eq!(i2c.pcal[PCAL_CONFIG0 as usize] & ALL_CONTROL, ALL_CONTROL);
+        assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+    }
+    run_test!(
+        acked_but_ignored_pcal_direction_write_must_fault,
+        acked_but_ignored_pcal_direction_write_must_fault_body
+    );
+
 
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),

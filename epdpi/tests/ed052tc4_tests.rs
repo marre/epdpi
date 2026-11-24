@@ -146,3 +146,49 @@ epd_test!(
     full_refresh_uses_panel_specific_clear_and_gray_lut,
     full_refresh_uses_panel_specific_clear_and_gray_lut_body
 );
+
+
+#[maybe_async_cfg::maybe(
+    sync(feature = "blocking", keep_self),
+    async(not(feature = "blocking"), keep_self)
+)]
+async fn unsupported_ed052tc4_modes_fail_before_power_or_record_changes_body() {
+    const UNSUPPORTED: [RefreshMode; 5] = [
+        RefreshMode::M5Quality,
+        RefreshMode::M5Text,
+        RefreshMode::M5Fast,
+        RefreshMode::M5Fastest,
+        RefreshMode::FastMono,
+    ];
+    assert!(RefreshMode::Quality16.supported_for::<P>());
+    assert!(RefreshMode::Clear.supported_for::<P>());
+    for mode in UNSUPPORTED {
+        assert!(!mode.supported_for::<P>(), "{mode:?}");
+        let mut prev = vec![0xA5; P::FB_BYTES];
+        let mut line = vec![0x77; P::SCANLINE_BYTES];
+        let mut fbmem = vec![0; P::FB_BYTES];
+        let mut fb = EpdFrameBuffer::<P>::new(&mut fbmem).unwrap();
+        let mut d = EpdDisplayBuilder::<P>::new()
+            .build(RecordingBus::default(), &mut prev, &mut line)
+            .unwrap();
+        assert!(matches!(
+            d.refresh(&fb, mode).await,
+            Err(RefreshError::UnsupportedMode(failed)) if failed == mode
+        ));
+        assert!(matches!(
+            d.refresh_rect(&fb, mode, Rect::new(10, 10, 40, 40)).await,
+            Err(RefreshError::UnsupportedMode(failed)) if failed == mode
+        ));
+        assert!(matches!(
+            d.refresh_dirty(&mut fb, mode).await,
+            Err(RefreshError::UnsupportedMode(failed)) if failed == mode
+        ));
+        assert_eq!(d.release().events.len(), 0, "{mode:?}: bus must stay idle");
+        assert!(prev.iter().all(|&b| b == 0xA5), "{mode:?}: previous image unchanged");
+        assert!(fb.dirty().is_some(), "{mode:?}: dirty region must survive failed refresh");
+    }
+}
+epd_test!(
+    unsupported_ed052tc4_modes_fail_before_power_or_record_changes,
+    unsupported_ed052tc4_modes_fail_before_power_or_record_changes_body
+);

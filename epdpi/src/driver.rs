@@ -103,6 +103,19 @@ impl<BUS, PANEL> EpdDisplay<'_, BUS, PANEL> {
     async(not(feature = "blocking"), keep_self)
 )]
 impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
+    /// An unsuccessful power-on can have partially asserted rails. Request
+    /// shutdown even when the bus reports failure while switching on.
+    /// Keep the original failure; an attempted shutdown is best effort.
+    async fn begin_update(&mut self) -> Result<(), BUS::Error> {
+        match self.bus.set_power(true).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.bus.set_power(false).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Drives every pixel with `code` for `passes` passes.
     async fn drive_uniform(&mut self, code: DriveCode, passes: usize) -> Result<(), BUS::Error> {
         WaveformEngine::uniform_scanline::<PANEL>(code, self.scanline);
@@ -134,7 +147,7 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
 
     /// Flashes the panel to a clean white and resets the record of what it shows.
     pub async fn clear(&mut self) -> Result<(), BUS::Error> {
-        self.bus.set_power(true).await?;
+        self.begin_update().await?;
         let result = self.clear_cycle().await;
         let off = self.bus.set_power(false).await;
         result?;
@@ -213,7 +226,7 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
         mode: RefreshMode,
         window: Rect,
     ) -> Result<(), BUS::Error> {
-        self.bus.set_power(true).await?;
+        self.begin_update().await?;
         let result = self.run_refresh(fb, mode, window).await;
         let off = self.bus.set_power(false).await;
         result?;

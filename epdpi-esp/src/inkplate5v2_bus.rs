@@ -227,6 +227,10 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
                 PowerError::InvalidState(self.power.state())
             ));
         }
+        // Fail closed before driving any direct panel pins. This check must
+        // precede idle_before_power() because the panel could already be on
+        // after a reset or a partially completed earlier firmware session.
+        self.power.preflight_low_voltage().await.map_err(Inkplate5v2BusError::Power)?;
         {
             let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
             timing::idle_before_power(&mut s).await.map_err(|e| match e {
@@ -356,7 +360,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
             return Err(Inkplate5v2BusError::HardwareNotValidated);
         }
         if self.power.state() == PowerState::Uninitialized {
-            return Ok(());
+            return if self.faulted { Err(Inkplate5v2BusError::Faulted) } else { Ok(()) };
         }
         // A successful refresh must be allowed to power down and refresh
         // again. Do not use emergency_off() for an ordinary shutdown: it
@@ -591,16 +595,20 @@ mod tests {
         }
     }
 
-    fn bus() -> Inkplate5v2Bus<FakeTx, FakeI2c, FakeDelay, FakePin> {
+    fn bus_with_i2c(i2c: FakeI2c) -> Inkplate5v2Bus<FakeTx, FakeI2c, FakeDelay, FakePin> {
         Inkplate5v2Bus::new(
             FakeTx::default(),
-            Inkplate5v2Power::new(FakeI2c::fresh(), FakeDelay),
+            Inkplate5v2Power::new(i2c, FakeDelay),
             Inkplate5v2DirectPins {
                 le: FakePin::default(),
                 ckv: FakePin::default(),
                 sph: FakePin::default(),
             },
         )
+    }
+
+    fn bus() -> Inkplate5v2Bus<FakeTx, FakeI2c, FakeDelay, FakePin> {
+        bus_with_i2c(FakeI2c::fresh())
     }
 
     macro_rules! run_both {
@@ -632,6 +640,32 @@ mod tests {
         assert!(pins.le.writes.is_empty());
     }
     run_both!(read_only_diagnostics_are_non_driving, read_only_diagnostics_are_non_driving_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn unsafe_entry_must_not_touch_any_output_body() {
+        let mut fake = FakeI2c::fresh();
+        // P0.7 high means the e-paper rails may still be energized.
+        fake.regs0[0] = 0x80;
+        let mut b = bus_with_i2c(fake);
+        let result = b.prepare_low_voltage().await;
+        assert!(matches!(
+            result,
+            Err(Inkplate5v2BusError::Power(PowerError::PhysicalPowerGoodAlreadyHigh))
+        ));
+        let off = b.set_power(false).await;
+        assert!(matches!(off, Err(Inkplate5v2BusError::Faulted)));
+        let (tx, power, pins) = b.release();
+        let (i2c, _) = power.release();
+        assert!(i2c.writes.is_empty(), "No PCAL or PMIC writes on unsafe entry");
+        assert!(pins.ckv.writes.is_empty());
+        assert!(pins.sph.writes.is_empty());
+        assert!(pins.le.writes.is_empty());
+        assert_eq!(tx.transmissions, 0);
+    }
+    run_both!(unsafe_entry_must_not_touch_any_output, unsafe_entry_must_not_touch_any_output_body);
 
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),

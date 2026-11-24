@@ -55,6 +55,13 @@ pub const INKPLATE5V2_ROWS: usize = 720;
 )]
 pub trait Inkplate5v2Dma {
     type Error;
+    /// Route owned clock/data GPIOs to I2S after the off-state preflight.
+    fn arm_pins(&mut self) -> Result<(), Self::Error>;
+    /// Disconnect I2S from the clock/data pads and drive them low.
+    /// Must work even if the DMA transfer or its resources were lost.
+    fn quiesce_pins(&mut self) -> Result<(), Self::Error>;
+    /// Disable output drive and pulls on all clock/data GPIOs.
+    fn release_pins(&mut self) -> Result<(), Self::Error>;
     /// Pack and size DMA data without changing GPIO or starting a transfer.
     /// Must complete *before* asserting SPH.
     fn prepare_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error>;
@@ -62,22 +69,142 @@ pub trait Inkplate5v2Dma {
     async fn send_prepared_row(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Direct control pin with explicitly reversible output drive.
+pub trait Inkplate5v2ControlPin: OutputPin {
+    /// Enable output drive at the requested initial level.
+    fn arm_output(&mut self, high: bool) -> Result<(), Self::Error>;
+    /// Disable output drive and internal pulls.
+    fn release_output(&mut self) -> Result<(), Self::Error>;
+}
+
+#[cfg(feature = "esp32")]
+impl Inkplate5v2ControlPin for esp_hal::gpio::Flex<'_> {
+    fn arm_output(&mut self, high: bool) -> Result<(), Self::Error> {
+        use esp_hal::gpio::{Level, OutputConfig};
+        self.set_output_enable(false);
+        self.set_level(if high { Level::High } else { Level::Low });
+        self.apply_output_config(&OutputConfig::default());
+        self.set_output_enable(true);
+        Ok(())
+    }
+    fn release_output(&mut self) -> Result<(), Self::Error> {
+        use esp_hal::gpio::InputConfig;
+        self.set_output_enable(false);
+        self.apply_input_config(&InputConfig::default());
+        self.set_input_enable(true);
+        Ok(())
+    }
+}
+
+/// Inkplate-specific ESP32 I2S transport with retained, exclusive pin handles.
+/// The generic HAL transmitter remains reusable for other boards.
+#[cfg(feature = "esp32")]
+pub struct Inkplate5v2Tx {
+    tx: crate::i2s_parallel::Esp32I2sTx,
+    // D0..D7, then CL. These handles are never passed into the HAL I2S
+    // constructor. It receives NoPin placeholders instead.
+    pins: [esp_hal::gpio::AnyPin<'static>; 9],
+    armed: bool,
+}
+
+#[cfg(feature = "esp32")]
+impl Inkplate5v2Tx {
+    /// Create the I2S peripheral with no connected pads. GPIO ownership is
+    /// retained for disconnection after DMA failure as well as normal off.
+    pub fn new(
+        i2s: esp_hal::peripherals::I2S1<'static>,
+        channel: esp_hal::peripherals::DMA_I2S1<'static>,
+        buffer: esp_hal::dma::DmaTxBuf,
+        pins: [esp_hal::gpio::AnyPin<'static>; 9],
+    ) -> Self {
+        use esp_hal::{gpio::NoPin, i2s::parallel::{I2sParallel, TxEightBits}, time::Rate};
+        let parallel = I2sParallel::new(
+            i2s, channel, Rate::from_mhz(16),
+            TxEightBits::new(NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin, NoPin),
+            NoPin,
+        );
+        #[cfg(not(feature = "blocking"))]
+        let parallel = parallel.into_async();
+        Self { tx: crate::i2s_parallel::Esp32I2sTx::new(parallel, buffer), pins, armed: false }
+    }
+}
+
 #[cfg(feature = "esp32")]
 #[maybe_async_cfg::maybe(
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl Inkplate5v2Dma for crate::i2s_parallel::Esp32I2sTx {
+impl Inkplate5v2Dma for Inkplate5v2Tx {
     type Error = crate::i2s_parallel::I2sTxError;
-    fn prepare_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        self.prepare_inkplate5v2_scanline(data)
+
+    fn arm_pins(&mut self) -> Result<(), Self::Error> {
+        use esp_hal::gpio::{Flex, OutputConfig, OutputSignal};
+        // Match esp-hal 1.1 I2S1's 8-bit data_out_signal() and ws_signal().
+        // This preserves the existing routing, including its known
+        // unmeasured WS-versus-vendor-BCK clock difference.
+        let signals = [
+            OutputSignal::I2S1O_DATA_0, OutputSignal::I2S1O_DATA_1,
+            OutputSignal::I2S1O_DATA_2, OutputSignal::I2S1O_DATA_3,
+            OutputSignal::I2S1O_DATA_4, OutputSignal::I2S1O_DATA_5,
+            OutputSignal::I2S1O_DATA_6, OutputSignal::I2S1O_DATA_7,
+            OutputSignal::I2S1O_WS,
+        ];
+        for (pin, signal) in self.pins.iter_mut().zip(signals) {
+            let mut gpio = Flex::new(pin.reborrow());
+            gpio.set_low();
+            gpio.apply_output_config(&OutputConfig::default());
+            gpio.set_output_enable(true);
+            signal.connect_to(&gpio);
+        }
+        self.armed = true;
+        Ok(())
     }
+
+    fn quiesce_pins(&mut self) -> Result<(), Self::Error> {
+        use esp_hal::gpio::{Flex, OutputConfig};
+        self.armed = false;
+        self.tx.discard_prepared();
+        // Flex::new() disables output and resets GPIO matrix and IO MUX,
+        // including the peripheral-controlled output selection. Merely
+        // setting a GPIO latch or dropping I2sParallel is insufficient.
+        // Disconnect CL first, so subsequent data changes cannot be clocked.
+        for pin in self.pins.iter_mut().rev() {
+            let mut gpio = Flex::new(pin.reborrow());
+            gpio.set_low();
+            gpio.apply_output_config(&OutputConfig::default());
+            gpio.set_output_enable(true);
+        }
+        Ok(())
+    }
+
+    fn release_pins(&mut self) -> Result<(), Self::Error> {
+        use esp_hal::gpio::{Flex, InputConfig};
+        self.armed = false;
+        self.tx.discard_prepared();
+        for pin in self.pins.iter_mut().rev() {
+            let mut gpio = Flex::new(pin.reborrow());
+            gpio.apply_input_config(&InputConfig::default());
+            gpio.set_input_enable(true);
+        }
+        Ok(())
+    }
+
+    fn prepare_vendor_row(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+        if !self.armed {
+            return Err(Self::Error::Unprepared);
+        }
+        self.tx.prepare_inkplate5v2_scanline(data)
+    }
+
     async fn send_prepared_row(&mut self) -> Result<(), Self::Error> {
-        self.send_prepared_inkplate5v2_scanline().await
+        if !self.armed {
+            return Err(Self::Error::Unprepared);
+        }
+        self.tx.send_prepared_inkplate5v2_scanline().await
     }
 }
 
-/// Direct ESP32 pins. Caller must supply already-configured output GPIOs.
+/// Direct ESP32 pins. Caller supplies exclusive handles with reversible drive.
 /// These are independent from the expander pin SPV.
 pub struct Inkplate5v2DirectPins<P> {
     pub le: P,
@@ -118,6 +245,7 @@ pub struct Inkplate5v2Bus<TX, I2C, DELAY, P> {
     power: Inkplate5v2Power<I2C, DELAY>,
     pins: Inkplate5v2DirectPins<P>,
     faulted: bool,
+    io_released: bool,
     frame_open: bool,
     row_pending: bool,
     completed_rows: usize,
@@ -136,6 +264,7 @@ impl<TX, I2C, DELAY, P> Inkplate5v2Bus<TX, I2C, DELAY, P> {
             power,
             pins,
             faulted: false,
+            io_released: false,
             frame_open: false,
             row_pending: false,
             completed_rows: 0,
@@ -166,7 +295,7 @@ struct Signals<'a, I2C, DELAY, P> {
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<I2C: I2c, DELAY: DelayNs, P: OutputPin> Inkplate5v2Signals
+impl<I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin> Inkplate5v2Signals
     for Signals<'_, I2C, DELAY, P>
 {
     type Error = Inkplate5v2BusError<I2C::Error, P::Error, ()>;
@@ -207,7 +336,7 @@ impl<I2C: I2c, DELAY: DelayNs, P: OutputPin> Inkplate5v2Signals
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
+impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
     Inkplate5v2Bus<TX, I2C, DELAY, P>
 {
     /// Low-voltage preparation, **not** a read-only diagnostic.
@@ -228,15 +357,18 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     async fn prepare_sequence(
         &mut self,
     ) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
-        if self.power.state() != PowerState::Uninitialized {
-            return Err(Inkplate5v2BusError::Power(
-                PowerError::InvalidState(self.power.state())
-            ));
+        // Fail closed before driving any direct panel pins. On a repeat
+        // cycle, verify the released GPIO configuration and rearm only
+        // while PMIC controls are still low.
+        if self.io_released {
+            self.power.rearm_panel_controls().await.map_err(Inkplate5v2BusError::Power)?;
+        } else {
+            self.power.preflight_low_voltage().await.map_err(Inkplate5v2BusError::Power)?;
+            self.power.initialize().await.map_err(Inkplate5v2BusError::Power)?;
         }
-        // Fail closed before driving any direct panel pins. This check must
-        // precede idle_before_power() because the panel could already be on
-        // after a reset or a partially completed earlier firmware session.
-        self.power.preflight_low_voltage().await.map_err(Inkplate5v2BusError::Power)?;
+        self.pins.le.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
+        self.pins.ckv.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
+        self.pins.sph.arm_output(true).map_err(Inkplate5v2BusError::Gpio)?;
         {
             let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
             timing::idle_before_power(&mut s).await.map_err(|e| match e {
@@ -245,8 +377,9 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
                 _ => Inkplate5v2BusError::Faulted,
             })?;
         }
-        self.power.initialize().await.map_err(Inkplate5v2BusError::Power)?;
+        self.tx.arm_pins().map_err(Inkplate5v2BusError::Dma)?;
         self.power.configure_clock_gate().await.map_err(Inkplate5v2BusError::Power)?;
+        self.io_released = false;
         Ok(())
     }
 
@@ -281,9 +414,18 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     ) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
         let previously_faulted = self.faulted;
         self.faulted = true;
+        if self.io_released {
+            self.power.verify_released_controls().await.map_err(Inkplate5v2BusError::Power)?;
+            if emergency || previously_faulted {
+                return Err(Inkplate5v2BusError::Faulted);
+            }
+            self.faulted = false;
+            return Ok(());
+        }
         let gate = self.power.quiesce_panel().await;
+        let clock_data_low = self.tx.quiesce_pins();
         // Match the vendor's OE/GMOD-low before direct control changes.
-        // TODO: quiesce and release I2S CL/data, then high-Z all panel pins.
+        // Clock and data have been disconnected from I2S above.
         let mut first_gpio_error = None;
         if let Err(error) = self.pins.sph.set_low() {
             first_gpio_error = Some(error);
@@ -300,14 +442,33 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         }
         // Even an OE or direct GPIO failure must not skip PMIC shutdown.
         let off = self.power.disable().await;
+        // Always remove direct pad drive, even if PMIC status is uncertain.
+        // Keep expander OE/GMOD/SPV driven low on uncertain rail shutdown.
+        let clock_data_z = self.tx.release_pins();
+        for pin in [&mut self.pins.le, &mut self.pins.ckv, &mut self.pins.sph] {
+            if let Err(error) = pin.release_output()
+                && first_gpio_error.is_none()
+            {
+                first_gpio_error = Some(error);
+            }
+        }
+        let expander_z = if off.is_ok() && self.power.state() == PowerState::Idle {
+            self.power.release_panel_controls().await
+        } else {
+            Ok(())
+        };
         self.frame_open = false;
         self.row_pending = false;
         self.completed_rows = 0;
         gate.map_err(Inkplate5v2BusError::Power)?;
+        clock_data_low.map_err(Inkplate5v2BusError::Dma)?;
         if let Some(error) = first_gpio_error {
             return Err(Inkplate5v2BusError::Gpio(error));
         }
         off.map_err(Inkplate5v2BusError::Power)?;
+        clock_data_z.map_err(Inkplate5v2BusError::Dma)?;
+        expander_z.map_err(Inkplate5v2BusError::Power)?;
+        self.io_released = self.power.state() == PowerState::Idle;
         if emergency || previously_faulted || self.power.state() == PowerState::Faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }
@@ -321,7 +482,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         if self.faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }
-        if self.power.state() != PowerState::On {
+        if self.io_released || self.power.state() != PowerState::On {
             return Err(Inkplate5v2BusError::NotPowered);
         }
         Ok(())
@@ -406,7 +567,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
+impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
     EpdParallelBus for Inkplate5v2Bus<TX, I2C, DELAY, P>
 {
     type Error = Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>;
@@ -598,6 +759,7 @@ mod tests {
     #[derive(Default)]
     struct FakePin {
         writes: Vec<bool>,
+        released: bool,
         name: &'static str,
         trace: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
@@ -631,11 +793,26 @@ mod tests {
         }
     }
 
+    impl Inkplate5v2ControlPin for FakePin {
+        fn arm_output(&mut self, _high: bool) -> Result<(), Infallible> {
+            self.released = false;
+            Ok(())
+        }
+        fn release_output(&mut self) -> Result<(), Infallible> {
+            self.released = true;
+            if let Some(trace) = &self.trace { trace.borrow_mut().push("control-high-z"); }
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct FakeTx {
         transmissions: usize,
         preparations: usize,
         prepared: bool,
+        released: bool,
+        fail_send: bool,
+        fail_quiesce: bool,
         trace: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
     #[maybe_async_cfg::maybe(
@@ -643,7 +820,21 @@ mod tests {
         async(not(feature = "blocking"), keep_self)
     )]
     impl Inkplate5v2Dma for FakeTx {
-        type Error = Infallible;
+        type Error = BusFault;
+        fn arm_pins(&mut self) -> Result<(), Self::Error> {
+            self.released = false;
+            Ok(())
+        }
+        fn quiesce_pins(&mut self) -> Result<(), Self::Error> {
+            self.prepared = false;
+            if let Some(trace) = &self.trace { trace.borrow_mut().push("clock-data-low"); }
+            if self.fail_quiesce { Err(BusFault) } else { Ok(()) }
+        }
+        fn release_pins(&mut self) -> Result<(), Self::Error> {
+            self.released = true;
+            if let Some(trace) = &self.trace { trace.borrow_mut().push("clock-data-high-z"); }
+            Ok(())
+        }
         fn prepare_vendor_row(&mut self, _: &[u8]) -> Result<(), Self::Error> {
             self.preparations += 1;
             self.prepared = true;
@@ -653,6 +844,7 @@ mod tests {
         async fn send_prepared_row(&mut self) -> Result<(), Self::Error> {
             assert!(self.prepared);
             self.prepared = false;
+            if self.fail_send { return Err(BusFault); }
             self.transmissions += 1;
             if let Some(trace) = &self.trace { trace.borrow_mut().push("dma-sent"); }
             Ok(())
@@ -801,7 +993,10 @@ mod tests {
     async fn normal_power_off_preserves_bus_and_allows_repeated_updates_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        for _ in 0..2 {
+        for cycle in 0..2 {
+            if cycle != 0 {
+                b.prepare_low_voltage().await.unwrap();
+            }
             // Exercise the existing crate-private power controller to simulate
             // a fully powered state. The public HV interlock stays locked.
             b.power.enable().await.unwrap();
@@ -811,6 +1006,14 @@ mod tests {
             assert!(!b.faulted);
             assert!(!b.frame_open);
             assert!(!b.row_pending);
+            assert!(b.io_released);
+            assert!(b.tx.released);
+            assert!(b.pins.le.released && b.pins.ckv.released && b.pins.sph.released);
+            let snapshot = b.inspect().await.unwrap();
+            assert_eq!(snapshot.direction_port0 & 0x3f, 7);
+            assert!(!snapshot.clock_enabled());
+            // Repeated shutdown must not briefly turn the pins back on.
+            b.set_power(false).await.unwrap();
         }
         let (tx, power, _) = b.release();
         let (i2c, _) = power.release();
@@ -987,5 +1190,47 @@ mod tests {
         exact_row_count_survives_multiple_complete_frames,
         exact_row_count_survives_multiple_complete_frames_body
     );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn dma_failure_releases_all_panel_pins_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        b.power.enable().await.unwrap(); // test only
+        b.start_frame().await.unwrap();
+        b.tx.fail_send = true;
+        assert!(matches!(b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await,
+            Err(Inkplate5v2BusError::Dma(BusFault))));
+        assert!(b.faulted);
+        assert!(b.tx.released);
+        assert!(b.pins.le.released && b.pins.ckv.released && b.pins.sph.released);
+        let snapshot = b.inspect().await.unwrap();
+        assert_eq!(snapshot.direction_port0 & 0x3f, 7);
+        assert!(!snapshot.clock_enabled());
+        assert!(!snapshot.pgood_pin_high());
+        assert!(matches!(b.start_frame().await, Err(Inkplate5v2BusError::Faulted)));
+    }
+    run_both!(dma_failure_releases_all_panel_pins, dma_failure_releases_all_panel_pins_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn quiesce_failure_does_not_skip_power_or_high_z_body() {
+        let mut b = bus();
+        b.prepare_low_voltage().await.unwrap();
+        b.power.enable().await.unwrap();
+        b.tx.fail_quiesce = true;
+        assert!(matches!(b.set_power(false).await, Err(Inkplate5v2BusError::Dma(BusFault))));
+        assert!(b.faulted);
+        assert!(b.tx.released);
+        assert!(b.pins.le.released && b.pins.ckv.released && b.pins.sph.released);
+        let snapshot = b.inspect().await.unwrap();
+        assert_eq!(snapshot.direction_port0 & 0x3f, 7);
+        assert!(!snapshot.pgood_pin_high());
+    }
+    run_both!(quiesce_failure_does_not_skip_power_or_high_z, quiesce_failure_does_not_skip_power_or_high_z_body);
 
 }

@@ -26,17 +26,14 @@ use esp_hal::{
 
 #[cfg(feature = "low-voltage-prep")]
 use epdpi_esp::{
-    i2s_parallel::Esp32I2sTx,
-    inkplate5v2_bus::{Inkplate5v2Bus, Inkplate5v2DirectPins},
+    inkplate5v2_bus::{Inkplate5v2Bus, Inkplate5v2DirectPins, Inkplate5v2Tx},
 };
 
 #[cfg(feature = "low-voltage-prep")]
 use esp_hal::{
     dma::{DmaTxBuf},
     dma_buffers,
-    gpio::{Level, Output, OutputConfig},
-    i2s::parallel::{I2sParallel, TxEightBits},
-    time::Rate,
+    gpio::{Flex, Pin},
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -133,34 +130,23 @@ fn main() -> ! {
         }
         esp_println::println!("Read-only power-entry preflight passed.");
 
-        // Direct control pins are brought to the manufacturer's idle levels
-        // *before* I2S is attached to GPIO0 and before PMIC setup.
+        // Keep the direct control pins flexible and initially non-driving.
+        // The bus arms the pins only after its own off-state checks.
         let pins = Inkplate5v2DirectPins {
-            le: Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default()),
-            ckv: Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default()),
-            sph: Output::new(peripherals.GPIO33, Level::High, OutputConfig::default()),
+            le: Flex::new(peripherals.GPIO2),
+            ckv: Flex::new(peripherals.GPIO32),
+            sph: Flex::new(peripherals.GPIO33),
         };
 
-        // Construct the existing esp-hal I2S1 DMA transport. This sets up
-        // low-voltage clock/data GPIO routing but sends NO bytes. The classic
-        // ESP32 I2S1 data pin mapping follows Soldered's V2 board schematic.
-        let pixel_pins = TxEightBits::new(
-            peripherals.GPIO4,
-            peripherals.GPIO5,
-            peripherals.GPIO18,
-            peripherals.GPIO19,
-            peripherals.GPIO23,
-            peripherals.GPIO25,
-            peripherals.GPIO26,
-            peripherals.GPIO27,
-        );
-        let parallel = I2sParallel::new(
-            peripherals.I2S1,
-            peripherals.DMA_I2S1,
-            Rate::from_mhz(16),
-            pixel_pins,
-            peripherals.GPIO0,
-        );
+        // Keep exclusive GPIO ownership in the board transport; the HAL
+        // I2S peripheral itself is configured with NoPin placeholders.
+        let pixel_pins = [
+            peripherals.GPIO4.degrade(), peripherals.GPIO5.degrade(),
+            peripherals.GPIO18.degrade(), peripherals.GPIO19.degrade(),
+            peripherals.GPIO23.degrade(), peripherals.GPIO25.degrade(),
+            peripherals.GPIO26.degrade(), peripherals.GPIO27.degrade(),
+            peripherals.GPIO0.degrade(),
+        ];
         let (_, _, buffer, descriptors) = dma_buffers!(0, 336);
         let tx_buffer = match DmaTxBuf::new(descriptors, buffer) {
             Ok(buffer) => buffer,
@@ -169,7 +155,7 @@ fn main() -> ! {
                 loop { core::hint::spin_loop(); }
             }
         };
-        let tx = Esp32I2sTx::new(parallel, tx_buffer);
+        let tx = Inkplate5v2Tx::new(peripherals.I2S1, peripherals.DMA_I2S1, tx_buffer, pixel_pins);
         let mut bus = Inkplate5v2Bus::new(tx, power, pins);
 
         match bus.prepare_low_voltage() {
@@ -197,6 +183,13 @@ fn main() -> ! {
                 "Factory sequencer UP={:02X}/{:02X} DOWN={:02X}/{:02X}",
                 snapshot.upseq0, snapshot.upseq1, snapshot.dwnseq0, snapshot.dwnseq1
             );
+        }
+        // Exercise the same shutdown path used after a refresh, with HV
+        // never enabled. The diagnostic then stays in the released state.
+        use epdpi::EpdParallelBus;
+        match bus.set_power(false) {
+            Ok(()) => esp_println::println!("Panel GPIO shutdown complete; HV never enabled."),
+            Err(error) => esp_println::println!("Panel GPIO shutdown failed: {error:?}"),
         }
         loop {
             match bus.inspect() {

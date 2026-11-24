@@ -59,6 +59,11 @@ impl Esp32I2sTx {
         }
     }
 
+    /// Invalidate a prepared row on board shutdown.
+    pub(crate) fn discard_prepared(&mut self) {
+        self.prepared = false;
+    }
+
     /// Release the underlying peripherals after stopping transmission.
     pub fn release(self) -> (Option<I2sParallel<'static, Mode>>, Option<DmaTxBuf>) {
         (self.i2s, self.buffer)

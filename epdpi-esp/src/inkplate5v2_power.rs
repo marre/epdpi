@@ -34,6 +34,7 @@ const PCAL_POLARITY0: u8 = 0x04;
 const PCAL_POLARITY1: u8 = 0x05;
 const PCAL_INPUT_LATCH0: u8 = 0x44;
 const PCAL_INPUT_LATCH1: u8 = 0x45;
+const PCAL_PULL_ENABLE0: u8 = 0x46;
 const PCAL_OUTPUT0: u8 = 0x02;
 const PCAL_OUTPUT1: u8 = 0x03;
 const PCAL_CONFIG0: u8 = 0x06;
@@ -76,7 +77,9 @@ const SPV: u8 = 1 << 2;
 const WAKEUP: u8 = 1 << 3;
 const PWRUP: u8 = 1 << 4;
 const VCOM: u8 = 1 << 5;
-const ALL_CONTROL: u8 = OE | GMOD | SPV | WAKEUP | PWRUP | VCOM;
+const PANEL_CONTROL: u8 = OE | GMOD | SPV;
+const PMIC_CONTROL: u8 = WAKEUP | PWRUP | VCOM;
+const ALL_CONTROL: u8 = PANEL_CONTROL | PMIC_CONTROL;
 
 /// Port 1, bit 0 (expander pin 8) enables the ESP32 GPIO0 clock path.
 /// Only the explicit low-voltage clock setup method may modify this pin.
@@ -384,6 +387,84 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         let check = self.inspect_expander().await?;
         if !check.clock_enabled() {
             return Err(PowerError::ClockReadbackMismatch);
+        }
+        self.state = PowerState::Idle;
+        Ok(())
+    }
+
+    /// Reconfigure previously released panel signals with low output latches.
+    /// PMIC control pins must still be driven low and PG must be low.
+    pub(crate) async fn rearm_panel_controls(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::Idle {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        self.state = PowerState::Faulted;
+        let snapshot = self.inspect_expander().await?;
+        Self::verify_released_snapshot(snapshot)?;
+        self.expander_levels(PANEL_CONTROL, 0).await?;
+        self.write(EXPANDER_ADDR, PCAL_CONFIG0, &[snapshot.direction_port0 & !PANEL_CONTROL]).await?;
+        let check = self.inspect_expander().await?;
+        Self::verify_initial_snapshot(check)?;
+        if check.direction_port0 & ALL_CONTROL != 0 || check.output_port0 & ALL_CONTROL != 0 {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        self.state = PowerState::Idle;
+        Ok(())
+    }
+
+    fn verify_released_snapshot(snapshot: ExpanderSnapshot) -> Result<(), PowerError<I2C::Error>> {
+        // Floating panel inputs may read either level. Never interpret
+        // those inputs as driven controls. PMIC controls must remain low.
+        if snapshot.pgood_pin_high()
+            || snapshot.direction_port0 & (PWR_GOOD_PIN | ALL_CONTROL) != PWR_GOOD_PIN | PANEL_CONTROL
+            || snapshot.input_port0 & PMIC_CONTROL != 0
+            || snapshot.output_port0 & ALL_CONTROL != 0
+            || snapshot.direction_port1 & GPIO0_ENABLE != 0
+            || (snapshot.input_port1 | snapshot.output_port1) & GPIO0_ENABLE != 0
+        {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        Ok(())
+    }
+
+    /// Release OE/GMOD/SPV to inputs without pulls after a verified shutdown.
+    /// Keep WAKEUP/PWRUP/VCOM low and disconnect the GPIO0 clock gate.
+    /// Never release the expander panel outputs while PMIC shutdown is uncertain.
+    pub(crate) async fn release_panel_controls(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::Idle {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        self.state = PowerState::Faulted;
+        let snapshot = self.inspect_expander().await?;
+        Self::verify_initial_snapshot(snapshot)?;
+        if snapshot.direction_port0 & ALL_CONTROL != 0 || snapshot.output_port0 & ALL_CONTROL != 0 {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        // Gate off before releasing panel signals. Leave unrelated Port 1
+        // latches and directions untouched.
+        self.write(EXPANDER_ADDR, PCAL_OUTPUT1, &[snapshot.output_port1 & !GPIO0_ENABLE]).await?;
+        self.write(EXPANDER_ADDR, PCAL_CONFIG1, &[snapshot.direction_port1 & !GPIO0_ENABLE]).await?;
+        let pulls = self.read(EXPANDER_ADDR, PCAL_PULL_ENABLE0).await?;
+        self.write(EXPANDER_ADDR, PCAL_PULL_ENABLE0, &[pulls & !PANEL_CONTROL]).await?;
+        self.write(EXPANDER_ADDR, PCAL_CONFIG0, &[snapshot.direction_port0 | PANEL_CONTROL]).await?;
+        let check = self.inspect_expander().await?;
+        Self::verify_released_snapshot(check)?;
+        if self.read(EXPANDER_ADDR, PCAL_PULL_ENABLE0).await? & PANEL_CONTROL != 0 {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        self.state = PowerState::Idle;
+        Ok(())
+    }
+
+    /// Verify the off pin configuration without changing released outputs.
+    pub(crate) async fn verify_released_controls(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::Idle {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        self.state = PowerState::Faulted;
+        Self::verify_released_snapshot(self.inspect_expander().await?)?;
+        if self.read(EXPANDER_ADDR, PCAL_PULL_ENABLE0).await? & PANEL_CONTROL != 0 {
+            return Err(PowerError::LowVoltageReadbackMismatch);
         }
         self.state = PowerState::Idle;
         Ok(())

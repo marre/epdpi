@@ -269,16 +269,50 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
     }
 
     async fn emergency_off(&mut self) {
+        let _ = self.shutdown(true).await;
+    }
+
+    // One ordering for ordinary and emergency shutdown. Mark the bus
+    // unusable before the first await so a cancelled future cannot resume
+    // scanning. A healthy ordinary shutdown restores reusability.
+    async fn shutdown(
+        &mut self,
+        emergency: bool,
+    ) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
+        let previously_faulted = self.faulted;
         self.faulted = true;
-        // Best effort: leave clock/data signals idle and request PMIC off.
-        // There is no guarantee this runs on cancellation or hard reset.
-        let _ = self.pins.sph.set_low();
-        let _ = self.pins.ckv.set_low();
-        let _ = self.pins.le.set_low();
-        let _ = self.power.disable().await;
+        let gate = self.power.quiesce_panel().await;
+        // Match the vendor's OE/GMOD-low before direct control changes.
+        // TODO: quiesce and release I2S CL/data, then high-Z all panel pins.
+        let mut first_gpio_error = None;
+        if let Err(error) = self.pins.sph.set_low() {
+            first_gpio_error = Some(error);
+        }
+        if let Err(error) = self.pins.ckv.set_low()
+            && first_gpio_error.is_none()
+        {
+            first_gpio_error = Some(error);
+        }
+        if let Err(error) = self.pins.le.set_low()
+            && first_gpio_error.is_none()
+        {
+            first_gpio_error = Some(error);
+        }
+        // Even an OE or direct GPIO failure must not skip PMIC shutdown.
+        let off = self.power.disable().await;
         self.frame_open = false;
         self.row_pending = false;
         self.completed_rows = 0;
+        gate.map_err(Inkplate5v2BusError::Power)?;
+        if let Some(error) = first_gpio_error {
+            return Err(Inkplate5v2BusError::Gpio(error));
+        }
+        off.map_err(Inkplate5v2BusError::Power)?;
+        if emergency || previously_faulted || self.power.state() == PowerState::Faulted {
+            return Err(Inkplate5v2BusError::Faulted);
+        }
+        self.faulted = false;
+        Ok(())
     }
 
     async fn require_ready(
@@ -386,44 +420,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: OutputPin>
         if self.power.state() == PowerState::Uninitialized {
             return if self.faulted { Err(Inkplate5v2BusError::Faulted) } else { Ok(()) };
         }
-        // A successful refresh must be allowed to power down and refresh
-        // again. Do not use emergency_off() for an ordinary shutdown: it
-        // deliberately latches faulted and invalidates the reusable bus.
-        // Always request a PMIC shutdown even if one GPIO operation fails.
-        let mut first_gpio_error = None;
-        // Match Soldered einkOff(): CKV/SPH/LE low before requesting
-        // PMIC shutdown. The direct GPIO high-Z step still requires
-        // board-specific pin-release support after rails are off.
-        if let Err(error) = self.pins.sph.set_low() {
-            first_gpio_error = Some(error);
-        }
-        if let Err(error) = self.pins.ckv.set_low()
-            && first_gpio_error.is_none()
-        {
-            first_gpio_error = Some(error);
-        }
-        if let Err(error) = self.pins.le.set_low()
-            && first_gpio_error.is_none()
-        {
-            first_gpio_error = Some(error);
-        }
-
-        let off = self.power.disable().await;
-        self.frame_open = false;
-        self.row_pending = false;
-        self.completed_rows = 0;
-        if let Some(error) = first_gpio_error {
-            self.faulted = true;
-            return Err(Inkplate5v2BusError::Gpio(error));
-        }
-        if let Err(error) = off {
-            self.faulted = true;
-            return Err(Inkplate5v2BusError::Power(error));
-        }
-        if self.faulted || self.power.state() == PowerState::Faulted {
-            return Err(Inkplate5v2BusError::Faulted);
-        }
-        Ok(())
+        self.shutdown(false).await
     }
 
     async fn start_frame(&mut self) -> Result<(), Self::Error> {
@@ -482,9 +479,8 @@ mod tests {
         fn kind(&self) -> ErrorKind { ErrorKind::Other }
     }
 
-    #[derive(Default)]
     struct FakeI2c {
-        regs0: [u8; 8],
+        regs0: [u8; 0x50],
         pmic_enable: u8,
         pmic_registers: [u8; 17],
         writes: Vec<(u8, u8, u8)>,
@@ -494,7 +490,14 @@ mod tests {
     }
     impl FakeI2c {
         fn fresh() -> Self {
-            let mut x = Self::default();
+            let mut x = Self {
+                regs0: [0; 0x50],
+                pmic_enable: 0,
+                pmic_registers: [0; 17],
+                writes: Vec::new(),
+                rails_ready: Rc::new(Cell::new(false)),
+                physical_pgood: Rc::new(Cell::new(None)),
+            };
             // All 16 expander pins are inputs at power-on.
             x.regs0[6] = 0xff;
             x.regs0[7] = 0xff;
@@ -527,7 +530,7 @@ mod tests {
                             register = first;
                             for &v in values {
                                 self.writes.push((addr, register, v));
-                                if addr == 0x20 && register < 8 {
+                                if addr == 0x20 && register < 0x50 {
                                     self.regs0[usize::from(register)] = v;
                                     if self.regs0[2] & !self.regs0[6] & 0x08 == 0 {
                                         self.pmic_enable = 0;
@@ -554,7 +557,9 @@ mod tests {
                             let physical = self.physical_pgood.get().unwrap_or(powered);
                             (self.regs0[0] & !0x80) | (self.regs0[2] & !self.regs0[6] & 0x3f)
                                 | if physical { 0x80 } else { 0 }
-                        } else if addr == 0x20 && register < 8 {
+                        } else if addr == 0x20 && register == 0x01 {
+                            self.regs0[1] | (self.regs0[3] & !self.regs0[7])
+                        } else if addr == 0x20 && register < 0x50 {
                             self.regs0[usize::from(register)]
                         } else if addr == 0x48 && register == 0x0f
                             && self.pmic_enable == 0x20

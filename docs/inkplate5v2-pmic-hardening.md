@@ -5,6 +5,8 @@ Source: [TI TPS65186 SLVSB04A](https://www.ti.com/lit/ds/symlink/tps65186.pdf), 
 - Wait 5 ms after WAKEUP before I2C (TI minimum 1.8 ms).
 - Check actual expander input levels as well as latches before wake, especially PWRUP. Initial standby inspection does not write PMIC registers.
 - Sleep reloads factory defaults. Configure and read back the four sequencing registers on each actual power-up, retaining the factory-loaded delay bytes rather than forcing shorter delays. Keep the vendor active order e4/1b.
+- Check PCAL input inversion and input latch registers before using pin readings (NXP PCAL6416A Rev. 7.1 §§7.4.3, 7.4.6); read physical Port 1 clock gate as well as its direction and latch. Check ENABLE status at each new frame, not only at startup.
+- Ordinary and emergency bus shutdown share one path. Disable OE/GMOD before changing direct GPIOs and latch the bus before awaiting shutdown. Complete I2S/CL/data high-Z still open.
 - Confirm ENABLE state and physical controls before and after enabling VCOM, then enable OE. ENABLE and PG are status indicators, not voltage measurements.
 - Power-down waits for both PG indicators, verifies HV/VCOM enable bits cleared before clearing V3P3 while awake, then requests sleep. Never write ENABLE after lowering WAKEUP. On failed PG or I2C do not directly clear individual HV enable bits; request sequenced shutdown via WAKEUP. No automatic restart.
 - Mark shutdown faulted before asynchronous operations; cancellation cannot leave a reusable On state. This does not guarantee cleanup runs on cancellation.

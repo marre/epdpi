@@ -29,6 +29,11 @@ use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 const EXPANDER_ADDR: u8 = 0x20;
 const PMIC_ADDR: u8 = 0x48;
 const PCAL_INPUT0: u8 = 0x00;
+const PCAL_INPUT1: u8 = 0x01;
+const PCAL_POLARITY0: u8 = 0x04;
+const PCAL_POLARITY1: u8 = 0x05;
+const PCAL_INPUT_LATCH0: u8 = 0x44;
+const PCAL_INPUT_LATCH1: u8 = 0x45;
 const PCAL_OUTPUT0: u8 = 0x02;
 const PCAL_OUTPUT1: u8 = 0x03;
 const PCAL_CONFIG0: u8 = 0x06;
@@ -99,6 +104,8 @@ pub enum PowerState {
 pub struct ExpanderSnapshot {
     /// Actual P0 input levels, including physical PWR_GOOD on bit 7.
     pub input_port0: u8,
+    /// Actual Port 1 input levels, including the clock gate on bit 0.
+    pub input_port1: u8,
     pub output_port0: u8,
     pub direction_port0: u8,
     pub output_port1: u8,
@@ -115,7 +122,9 @@ impl ExpanderSnapshot {
 
     /// Whether GPIO0 clock enable is configured as an active HIGH output.
     pub fn clock_enabled(self) -> bool {
-        self.direction_port1 & GPIO0_ENABLE == 0 && self.output_port1 & GPIO0_ENABLE != 0
+        self.direction_port1 & GPIO0_ENABLE == 0
+            && self.output_port1 & GPIO0_ENABLE != 0
+            && self.input_port1 & GPIO0_ENABLE != 0
     }
 }
 
@@ -177,6 +186,8 @@ pub enum PowerError<E> {
     PowerGoodPinNotInput,
     /// PCAL readback did not confirm all panel control outputs inactive.
     LowVoltageReadbackMismatch,
+    /// Input polarity or latch configuration would make safety readings unreliable.
+    ExpanderInputConfig,
     /// The programmed PMIC sequencer did not read back correctly.
     SequencerReadbackMismatch,
     /// PMIC enable status does not match the expected state.
@@ -279,8 +290,21 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
     /// rails. This is safe as a first diagnostic after the I2C bus is ready.
     /// It does not access a possibly sleeping TPS65186.
     pub async fn inspect_expander(&mut self) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
+        // NXP PCAL6416A §§7.4.3, 7.4.6: input inversion and input
+        // latching can turn a pin read into an inverted or stale observation.
+        // Refuse safety decisions based on such a configuration. Do not
+        // silently change other expander users' settings.
+        let mask0 = ALL_CONTROL | PWR_GOOD_PIN;
+        if self.read(EXPANDER_ADDR, PCAL_POLARITY0).await? & mask0 != 0
+            || self.read(EXPANDER_ADDR, PCAL_INPUT_LATCH0).await? & mask0 != 0
+            || self.read(EXPANDER_ADDR, PCAL_POLARITY1).await? & GPIO0_ENABLE != 0
+            || self.read(EXPANDER_ADDR, PCAL_INPUT_LATCH1).await? & GPIO0_ENABLE != 0
+        {
+            return Err(PowerError::ExpanderInputConfig);
+        }
         Ok(ExpanderSnapshot {
             input_port0: self.read(EXPANDER_ADDR, PCAL_INPUT0).await?,
+            input_port1: self.read(EXPANDER_ADDR, PCAL_INPUT1).await?,
             direction_port0: self.read(EXPANDER_ADDR, PCAL_CONFIG0).await?,
             output_port0: self.read(EXPANDER_ADDR, PCAL_OUTPUT0).await?,
             direction_port1: self.read(EXPANDER_ADDR, PCAL_CONFIG1).await?,
@@ -587,6 +611,10 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if !snapshot.pgood_pin_high() {
             return Err(PowerError::PhysicalPowerGoodLow);
         }
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable & (V3P3_ENABLE | HV_ENABLE_MASK) != V3P3_ENABLE | HV_ENABLE_MASK {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
         let active = ALL_CONTROL;
         if snapshot.direction_port0 & active != 0
             || snapshot.direction_port0 & PWR_GOOD_PIN == 0
@@ -599,6 +627,20 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         Ok(())
     }
 
+    /// Suppress panel output before changing direct scan GPIOs.
+    /// Board shutdown calls this first, and disable() repeats the request.
+    /// An error must not prevent the remaining shutdown steps.
+    pub(crate) async fn quiesce_panel(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if matches!(self.state, PowerState::Idle | PowerState::Uninitialized) {
+            return Ok(());
+        }
+        let result = self.expander_levels(OE | GMOD, 0).await;
+        if result.is_err() {
+            self.state = PowerState::Faulted;
+        }
+        result
+    }
+
     /// Disable VCOM and panel output, request rails off and wait until PGOOD
     /// reports zero. An I2C error or a timeout latches `Faulted`.
     ///
@@ -607,6 +649,16 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
     /// the I2C bus or the expander itself is stuck.
     pub(crate) async fn disable(&mut self) -> Result<(), PowerError<I2C::Error>> {
         if self.state == PowerState::Idle {
+            // A cached Idle must not hide an externally altered pin state.
+            self.state = PowerState::Faulted;
+            let snapshot = self.inspect_expander().await?;
+            Self::verify_initial_snapshot(snapshot)?;
+            if snapshot.direction_port0 & ALL_CONTROL != 0
+                || snapshot.output_port0 & ALL_CONTROL != 0
+            {
+                return Err(PowerError::LowVoltageReadbackMismatch);
+            }
+            self.state = PowerState::Idle;
             return Ok(());
         }
         if self.state == PowerState::Uninitialized {
@@ -780,7 +832,7 @@ mod tests {
     }
 
     struct FakeI2c {
-        pcal: [u8; 8],
+        pcal: [u8; 0x50],
         pmic: [u8; 17],
         events: Vec<Event>,
         rails_ready: bool,
@@ -797,7 +849,7 @@ mod tests {
 
     impl FakeI2c {
         fn new() -> Self {
-            let mut pcal = [0u8; 8];
+            let mut pcal = [0u8; 0x50];
             pcal[PCAL_CONFIG0 as usize] = 0xff;
             pcal[PCAL_OUTPUT0 as usize] = 0xff;
             pcal[PCAL_CONFIG1 as usize] = 0xff;
@@ -934,6 +986,9 @@ mod tests {
                                 } else {
                                     0
                                 }
+                            } else if addr == EXPANDER_ADDR && register == PCAL_INPUT1 {
+                                self.pcal[PCAL_INPUT1 as usize]
+                                    | (self.pcal[PCAL_OUTPUT1 as usize] & !self.pcal[PCAL_CONFIG1 as usize])
                             } else if addr == EXPANDER_ADDR {
                                 self.pcal[register as usize]
                             } else if addr == PMIC_ADDR && register == PMIC_ENABLE {
@@ -1545,5 +1600,39 @@ mod tests {
         assert_eq!(shutdown_poll_budget(0), SHUTDOWN_TIMEOUT_MS);
         assert_eq!(shutdown_poll_budget(0xff), 2410);
     }
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn unsafe_input_configuration_prevents_wake_body() {
+        for (reg, bit) in [
+            (PCAL_POLARITY0, PWR_GOOD_PIN), (PCAL_INPUT_LATCH0, PWR_GOOD_PIN),
+            (PCAL_POLARITY0, PWRUP), (PCAL_POLARITY1, GPIO0_ENABLE),
+            (PCAL_INPUT_LATCH1, GPIO0_ENABLE),
+        ] {
+            let mut i2c = FakeI2c::new();
+            i2c.pcal[reg as usize] = bit;
+            let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+            assert_eq!(power.initialize().await, Err(PowerError::ExpanderInputConfig));
+            assert_eq!(power.state(), PowerState::Faulted);
+            assert!(!power.i2c.events.iter().any(|event| matches!(event, Event::Write(..))));
+        }
+    }
+    run_test!(unsafe_input_configuration_prevents_wake,
+        unsafe_input_configuration_prevents_wake_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn cached_idle_is_revalidated_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.initialize().await.unwrap();
+        power.i2c.pcal[PCAL_INPUT0 as usize] |= PWRUP;
+        assert_eq!(power.disable().await, Err(PowerError::ActiveControlPins));
+        assert_eq!(power.state(), PowerState::Faulted);
+    }
+    run_test!(cached_idle_is_revalidated, cached_idle_is_revalidated_body);
 
 }

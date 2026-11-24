@@ -147,6 +147,7 @@ impl EpdPanel for Ed047tc1 {
     const WIDTH: u32 = 960;
     const HEIGHT: u32 = 540;
     const COLOR_MODE: ColorMode = ColorMode::Grayscale16;
+    const SUPPORTS_FAST_MONO: bool = true;
     /// Recorded only. The PaperDIY sets VCOM in hardware, and neither M5GFX nor FastEPD
     /// writes it (FastEPD lists -1600 for the PaperS3). The origin of -2000 is not known.
     const VCOM_MV: Option<i16> = Some(-2000);

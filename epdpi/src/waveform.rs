@@ -89,6 +89,24 @@ pub enum RefreshMode {
 }
 
 impl RefreshMode {
+    /// Whether a panel declares the waveform data needed for this mode.
+    /// Reject a missing table rather than clocking only the final idle frame
+    /// and falsely recording an image that was never drawn.
+    pub fn supported_for<PANEL: EpdPanel>(self) -> bool {
+        let valid = |lut: &[u8]| !lut.is_empty() && lut.len().is_multiple_of(16);
+        match self {
+            Self::Clear => PANEL::CLEAR_SEQUENCE.iter().any(|&(code, passes)| {
+                passes > 0 && matches!(code, DriveCode::Darken | DriveCode::Lighten)
+            }),
+            Self::Quality16 => valid(PANEL::WAVEFORM_LUT),
+            Self::FastMono => PANEL::SUPPORTS_FAST_MONO,
+            Self::M5Quality => valid(PANEL::ERASER_LUT) && valid(PANEL::QUALITY_LUT),
+            Self::M5Text => valid(PANEL::ERASER_LUT) && valid(PANEL::TEXT_LUT),
+            Self::M5Fast => valid(PANEL::FAST_LUT),
+            Self::M5Fastest => valid(PANEL::FASTEST_LUT),
+        }
+    }
+
     /// True when the refresh reduces the picture to black and white, so the record of what the
     /// panel shows must be reduced the same way.
     pub(crate) fn is_binary(self) -> bool {

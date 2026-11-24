@@ -113,7 +113,13 @@ pub fn pack_inkplate5v2_scanline(
         dma[base + 2] = reverse_drive_codes(logical[src]);
         dma[base + 3] = reverse_drive_codes(logical[src - 1]);
     }
-    dma[PIXEL_BYTES..ROW_BYTES].copy_from_slice(&logical[PIXEL_BYTES..ROW_BYTES]);
+    // Although the vendor emits zero padding, the HAL still swaps the
+    // 16 trailing samples in four-byte words. Keep the helper correct for
+    // nonzero test patterns as well as production zero padding.
+    pack_i2s1_scanline(
+        &logical[PIXEL_BYTES..ROW_BYTES],
+        &mut dma[PIXEL_BYTES..ROW_BYTES],
+    )?;
     Ok(ROW_BYTES)
 }
 

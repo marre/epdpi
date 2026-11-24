@@ -246,6 +246,8 @@ pub struct Inkplate5v2Bus<TX, I2C, DELAY, P> {
     pins: Inkplate5v2DirectPins<P>,
     faulted: bool,
     io_released: bool,
+    pads_armed: bool,
+    pads_release_pending: bool,
     frame_open: bool,
     row_pending: bool,
     completed_rows: usize,
@@ -265,6 +267,8 @@ impl<TX, I2C, DELAY, P> Inkplate5v2Bus<TX, I2C, DELAY, P> {
             pins,
             faulted: false,
             io_released: false,
+            pads_armed: false,
+            pads_release_pending: false,
             frame_open: false,
             row_pending: false,
             completed_rows: 0,
@@ -351,7 +355,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         let result = self.prepare_sequence().await;
         if result.is_ok() {
             self.faulted = false;
-        } else if self.power.state() == PowerState::Idle && !self.io_released {
+        } else if self.pads_release_pending {
             let _ = self.shutdown(true).await;
         }
         result
@@ -370,6 +374,8 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
             self.power.preflight_low_voltage().await.map_err(Inkplate5v2BusError::Power)?;
             self.power.initialize().await.map_err(Inkplate5v2BusError::Power)?;
         }
+        self.pads_armed = true;
+        self.pads_release_pending = true;
         self.pins.le.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
         self.pins.ckv.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
         self.pins.sph.arm_output(true).map_err(Inkplate5v2BusError::Gpio)?;
@@ -425,6 +431,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         let previously_faulted = self.faulted;
         self.faulted = true;
         if self.io_released {
+            self.release_direct_pads()?;
             self.power.verify_released_controls().await.map_err(Inkplate5v2BusError::Power)?;
             if emergency || previously_faulted {
                 return Err(Inkplate5v2BusError::Faulted);
@@ -433,35 +440,12 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
             return Ok(());
         }
         let gate = self.power.quiesce_panel().await;
-        let clock_data_low = self.tx.quiesce_pins();
-        // Match the vendor's OE/GMOD-low before direct control changes.
-        // Clock and data have been disconnected from I2S above.
-        let mut first_gpio_error = None;
-        if let Err(error) = self.pins.sph.set_low() {
-            first_gpio_error = Some(error);
-        }
-        if let Err(error) = self.pins.ckv.set_low()
-            && first_gpio_error.is_none()
-        {
-            first_gpio_error = Some(error);
-        }
-        if let Err(error) = self.pins.le.set_low()
-            && first_gpio_error.is_none()
-        {
-            first_gpio_error = Some(error);
-        }
+        let low = self.quiesce_direct_pads();
         // Even an OE or direct GPIO failure must not skip PMIC shutdown.
         let off = self.power.disable().await;
         // Always remove direct pad drive, even if PMIC status is uncertain.
         // Keep expander OE/GMOD/SPV driven low on uncertain rail shutdown.
-        let clock_data_z = self.tx.release_pins();
-        for pin in [&mut self.pins.le, &mut self.pins.ckv, &mut self.pins.sph] {
-            if let Err(error) = pin.release_output()
-                && first_gpio_error.is_none()
-            {
-                first_gpio_error = Some(error);
-            }
-        }
+        let direct_z = self.release_direct_pads();
         let expander_z = if off.is_ok() && self.power.state() == PowerState::Idle {
             self.power.release_panel_controls().await
         } else {
@@ -473,22 +457,61 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
         // Record a successfully released state even if quiescing reported
         // an earlier error. A retry must not drive the pins again.
         self.io_released = off.is_ok()
-            && clock_data_z.is_ok()
             && expander_z.is_ok()
-            && first_gpio_error.is_none()
             && self.power.state() == PowerState::Idle;
         gate.map_err(Inkplate5v2BusError::Power)?;
-        clock_data_low.map_err(Inkplate5v2BusError::Dma)?;
-        if let Some(error) = first_gpio_error {
-            return Err(Inkplate5v2BusError::Gpio(error));
-        }
+        low?;
         off.map_err(Inkplate5v2BusError::Power)?;
-        clock_data_z.map_err(Inkplate5v2BusError::Dma)?;
+        direct_z?;
         expander_z.map_err(Inkplate5v2BusError::Power)?;
         if emergency || previously_faulted || self.power.state() == PowerState::Faulted {
             return Err(Inkplate5v2BusError::Faulted);
         }
         self.faulted = false;
+        Ok(())
+    }
+
+    // Once this is attempted, never drive the pads low again on a retry.
+    // A cancelled shutdown may leave them low, so release remains pending.
+    fn quiesce_direct_pads(&mut self) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
+        if !self.pads_armed {
+            return Ok(());
+        }
+        self.pads_armed = false;
+        let dma = self.tx.quiesce_pins();
+        let mut first_gpio_error = None;
+        for pin in [&mut self.pins.sph, &mut self.pins.ckv, &mut self.pins.le] {
+            if let Err(error) = pin.set_low()
+                && first_gpio_error.is_none()
+            {
+                first_gpio_error = Some(error);
+            }
+        }
+        dma.map_err(Inkplate5v2BusError::Dma)?;
+        if let Some(error) = first_gpio_error {
+            return Err(Inkplate5v2BusError::Gpio(error));
+        }
+        Ok(())
+    }
+
+    fn release_direct_pads(&mut self) -> Inkplate5v2Result<I2C::Error, P::Error, TX::Error> {
+        if !self.pads_release_pending {
+            return Ok(());
+        }
+        let dma = self.tx.release_pins();
+        let mut first_gpio_error = None;
+        for pin in [&mut self.pins.le, &mut self.pins.ckv, &mut self.pins.sph] {
+            if let Err(error) = pin.release_output()
+                && first_gpio_error.is_none()
+            {
+                first_gpio_error = Some(error);
+            }
+        }
+        dma.map_err(Inkplate5v2BusError::Dma)?;
+        if let Some(error) = first_gpio_error {
+            return Err(Inkplate5v2BusError::Gpio(error));
+        }
+        self.pads_release_pending = false;
         Ok(())
     }
 
@@ -1248,6 +1271,9 @@ mod tests {
         let snapshot = b.inspect().await.unwrap();
         assert_eq!(snapshot.direction_port0 & 0x3f, 7);
         assert!(!snapshot.pgood_pin_high());
+        let writes = b.pins.ckv.writes.len();
+        let _ = b.set_power(false).await;
+        assert_eq!(b.pins.ckv.writes.len(), writes, "retry must not drive released pads");
     }
     run_both!(quiesce_failure_does_not_skip_power_or_high_z, quiesce_failure_does_not_skip_power_or_high_z_body);
 

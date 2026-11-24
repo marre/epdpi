@@ -23,8 +23,9 @@ This is **panel data only**. It has not been verified on Inkplate hardware. The 
 ESP32 I2S1 parallel transport, its byte ordering, GPIO expander, TPS65186 power sequencing,
 and timing need a separate board-specific implementation before any hardware refresh.
 The panel's factory VCOM calibration is not overridden. `Quality16` means the framework's
-full-cleaning grayscale mode; this panel renders eight physical levels. The M5GFX modes
-have no ED052TC4 waveform tables and should not be used with this panel.
+full-cleaning grayscale mode; this panel renders eight physical levels. The M5GFX modes have no ED052TC4 waveform tables and are rejected before
+power-on with `RefreshError::UnsupportedMode`. The generic four-pass `FastMono`
+waveform has not been verified for this panel and is also rejected.
 
 ## Status
 
@@ -65,13 +66,20 @@ display.refresh(&fb, RefreshMode::Quality16)?;
 Memory: `prev` and `fb_mem` are 259,200 bytes each (4 bits per pixel), `line` is 248 bytes.
 On the ESP32-S3 put the two big ones in PSRAM.
 
+`clear()`, `refresh()`, `refresh_rect()` and `refresh_dirty()` return
+`Result<(), RefreshError<BUS::Error>>`. Handle
+`RefreshError::UnsupportedMode(mode)` without touching the panel, or
+`RefreshError::Bus(error)` when the underlying bus fails. Mode availability
+is panel-specific: `mode.supported_for::<PANEL>()`. The typed error is an
+intentional API change in the unreleased Inkplate integration branch.
+
 ## Refresh modes
 
 | Mode | What it does | Notes |
 | :--- | :--- | :--- |
 | `Clear` | panel-specific full-clean sequence, then an idle frame | flashes |
 | `Quality16` | panel-specific clear, then the waveform LUT | ED047TC1: 16 gray levels; ED052TC4: 8 gray levels |
-| `FastMono` | 4 passes, drives only pixels that changed, threshold at gray 8 | no full-screen flash, 379 ms |
+| `FastMono` | 4 passes, drives only pixels that changed, threshold at gray 8 | ED047TC1 only (explicit opt-in); no full-screen flash, 379 ms |
 | `M5Quality` | M5GFX `epd_quality`: a short erase toward mid gray, then the 16-gray waveform for the target | no clear, needs the previous picture |
 | `M5Text` | M5GFX `epd_text`: the erase, then 12 passes, only for pixel pairs that are not white before and after | a page of text flashes less than `M5Quality` |
 | `M5Fast` | M5GFX `epd_fast`: black and white, 8 passes, only pixel pairs that changed | |

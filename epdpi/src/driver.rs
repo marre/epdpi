@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use crate::error::ValidationError;
+use crate::error::{RefreshError, ValidationError};
 use crate::graphics::{EpdFrameBuffer, Rect};
 use crate::traits::{DriveCode, EpdPanel, EpdParallelBus};
 use crate::waveform::{M5Pass, RefreshMode, WaveformEngine};
@@ -116,6 +116,13 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
         }
     }
 
+    fn validate_refresh_mode(mode: RefreshMode) -> Result<(), RefreshError<BUS::Error>> {
+        if !mode.supported_for::<PANEL>() {
+            return Err(RefreshError::UnsupportedMode(mode));
+        }
+        Ok(())
+    }
+
     /// Drives every pixel with `code` for `passes` passes.
     async fn drive_uniform(&mut self, code: DriveCode, passes: usize) -> Result<(), BUS::Error> {
         WaveformEngine::uniform_scanline::<PANEL>(code, self.scanline);
@@ -146,12 +153,13 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
     }
 
     /// Flashes the panel to a clean white and resets the record of what it shows.
-    pub async fn clear(&mut self) -> Result<(), BUS::Error> {
-        self.begin_update().await?;
+    pub async fn clear(&mut self) -> Result<(), RefreshError<BUS::Error>> {
+        Self::validate_refresh_mode(RefreshMode::Clear)?;
+        self.begin_update().await.map_err(RefreshError::Bus)?;
         let result = self.clear_cycle().await;
         let off = self.bus.set_power(false).await;
-        result?;
-        off?;
+        result.map_err(RefreshError::Bus)?;
+        off.map_err(RefreshError::Bus)?;
         self.prev_buffer[..PANEL::FB_BYTES].fill(0xff);
         Ok(())
     }
@@ -161,8 +169,10 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
         &mut self,
         fb: &EpdFrameBuffer<'_, PANEL>,
         mode: RefreshMode,
-    ) -> Result<(), BUS::Error> {
-        self.refresh_window(fb, mode, Rect::full::<PANEL>()).await
+    ) -> Result<(), RefreshError<BUS::Error>> {
+        Self::validate_refresh_mode(mode)?;
+        self.refresh_window(fb, mode, Rect::full::<PANEL>())
+            .await.map_err(RefreshError::Bus)
     }
 
     /// Like [`refresh`](Self::refresh) but only for the pixels inside `rect`, a [`Rect`] or, with
@@ -190,14 +200,15 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
         fb: &EpdFrameBuffer<'_, PANEL>,
         mode: RefreshMode,
         rect: impl Into<Rect>,
-    ) -> Result<(), BUS::Error> {
+    ) -> Result<(), RefreshError<BUS::Error>> {
+        Self::validate_refresh_mode(mode)?;
         if matches!(mode, RefreshMode::Quality16 | RefreshMode::Clear) {
             return self.refresh(fb, mode).await;
         }
         let Some(window) = rect.into().aligned::<PANEL>() else {
             return Ok(());
         };
-        self.refresh_window(fb, mode, window).await
+        self.refresh_window(fb, mode, window).await.map_err(RefreshError::Bus)
     }
 
     /// Refreshes only the area of `fb` written since the last call, like M5GFX's `display()`
@@ -211,7 +222,8 @@ impl<BUS: EpdParallelBus, PANEL: EpdPanel> EpdDisplay<'_, BUS, PANEL> {
         &mut self,
         fb: &mut EpdFrameBuffer<'_, PANEL>,
         mode: RefreshMode,
-    ) -> Result<(), BUS::Error> {
+    ) -> Result<(), RefreshError<BUS::Error>> {
+        Self::validate_refresh_mode(mode)?;
         let Some(area) = fb.dirty() else {
             return Ok(());
         };

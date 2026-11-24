@@ -155,7 +155,7 @@ After stable full grayscale support:
 | F (P1) | Reliability campaign and documented limitations | E |
 | G (P2) | Partial refresh and measured optimization | F |
 
-**Current software milestone:** The minimal HV-locked firmware and board binding build successfully. Next: complete **C — targeted existing I2S/packing/waveform audit**, then use the recoverable physical board for read-only diagnostics and low-voltage preparation. Do **not** start with a custom DMA implementation.
+**Current software milestone:** The HV-locked firmware and source-level I2S/packing/waveform audit are implemented, with host regression tests for repeated shutdown, physical PGOOD agreement and source-latch timing. The next gate is physical backup/recovery and read-only diagnostics; only after those should the first controlled refresh path be enabled. Do **not** rewrite DMA without evidence.
 
 ## When to revisit SPH/DMA timing
 
@@ -166,6 +166,8 @@ Only elevate the remaining `esp-hal` descriptor-start/EOF overhead if there is a
 Keep this branch as the integrated hardware-validation workspace ([PR #4](https://github.com/marre/epdpi/pull/4)); it is **not** a single upstreamable merge. Port generic ED052TC4/waveform improvements into PR #1 and reusable classic ESP32 transport improvements into PR #2 once validated. Keep board-specific power and GPIO support separate.
 
 ## References
+
+- [Completed source-level software audit and remaining physical uncertainties](inkplate5v2-software-audit.md)
 
 - [ED052TC4 datasheet and redistribution notice](inkplate5v2-datasheet.md)
 

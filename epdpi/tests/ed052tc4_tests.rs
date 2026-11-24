@@ -171,17 +171,17 @@ async fn unsupported_ed052tc4_modes_fail_before_power_or_record_changes_body() {
         let mut d = EpdDisplayBuilder::<P>::new()
             .build(RecordingBus::default(), &mut prev, &mut line)
             .unwrap();
+        let full = d.refresh(&fb, mode).await;
         assert!(matches!(
-            d.refresh(&fb, mode).await,
-            Err(RefreshError::UnsupportedMode(failed)) if failed == mode
+            full, Err(RefreshError::UnsupportedMode(failed)) if failed == mode
         ));
+        let partial = d.refresh_rect(&fb, mode, Rect::new(10, 10, 40, 40)).await;
         assert!(matches!(
-            d.refresh_rect(&fb, mode, Rect::new(10, 10, 40, 40)).await,
-            Err(RefreshError::UnsupportedMode(failed)) if failed == mode
+            partial, Err(RefreshError::UnsupportedMode(failed)) if failed == mode
         ));
+        let dirty = d.refresh_dirty(&mut fb, mode).await;
         assert!(matches!(
-            d.refresh_dirty(&mut fb, mode).await,
-            Err(RefreshError::UnsupportedMode(failed)) if failed == mode
+            dirty, Err(RefreshError::UnsupportedMode(failed)) if failed == mode
         ));
         assert_eq!(d.release().events.len(), 0, "{mode:?}: bus must stay idle");
         assert!(prev.iter().all(|&b| b == 0xA5), "{mode:?}: previous image unchanged");

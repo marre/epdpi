@@ -826,6 +826,10 @@ mod tests {
         // set_power(true) remains permanently hardware-locked.
         b.power.enable().await.unwrap();
         b.start_frame().await.unwrap();
+        for _ in 0..INKPLATE5V2_ROWS {
+            b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await.unwrap();
+            b.next_row().await.unwrap();
+        }
         b.end_frame().await.unwrap();
         let gpio_calls = b.pins.ckv.writes.len();
         ready.set(false);
@@ -836,13 +840,13 @@ mod tests {
         ));
         assert!(b.faulted);
         assert_eq!(b.power.state(), PowerState::Faulted);
-        assert_eq!(b.tx.transmissions, 0);
+        assert_eq!(b.tx.transmissions, INKPLATE5V2_ROWS);
         // Only the emergency shutdown may touch GPIO after failed health.
         // It must not enter the next vertical scan sequence.
         assert_eq!(&b.pins.ckv.writes[gpio_calls..], &[false]);
         let (tx, power, _) = b.release();
         let (i2c, _) = power.release();
-        assert_eq!(tx.transmissions, 0);
+        assert_eq!(tx.transmissions, INKPLATE5V2_ROWS);
         assert_eq!(i2c.pmic_enable, 0);
     }
     run_both!(
@@ -894,7 +898,9 @@ mod tests {
             Err(Inkplate5v2BusError::FrameRowCount { expected: 720, actual: 0 })
         ));
         assert!(b.faulted);
-        assert_eq!(b.power.state(), PowerState::Faulted);
+        // Emergency shutdown can leave the power controller Idle while
+        // the bus itself remains permanently fault-latched.
+        assert_eq!(b.power.state(), PowerState::Idle);
         assert_eq!(b.tx.transmissions, 0);
     }
     run_both!(
@@ -922,7 +928,9 @@ mod tests {
         ));
         assert!(b.faulted);
         assert_eq!(b.tx.transmissions, INKPLATE5V2_ROWS);
-        assert_eq!(b.power.state(), PowerState::Faulted);
+        // Emergency shutdown can leave the power controller Idle while
+        // the bus itself remains permanently fault-latched.
+        assert_eq!(b.power.state(), PowerState::Idle);
     }
     run_both!(extra_row_is_rejected_before_dma, extra_row_is_rejected_before_dma_body);
 

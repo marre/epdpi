@@ -93,7 +93,7 @@ impl RefreshMode {
     /// Reject a missing table rather than clocking only the final idle frame
     /// and falsely recording an image that was never drawn.
     pub fn supported_for<PANEL: EpdPanel>(self) -> bool {
-        let valid = |lut: &[u8]| !lut.is_empty() && lut.len().is_multiple_of(16);
+        let valid = |lut: &[u8]| !lut.is_empty() && lut.len() % 16 == 0;
         match self {
             Self::Clear => PANEL::CLEAR_SEQUENCE.iter().any(|&(code, passes)| {
                 passes > 0 && matches!(code, DriveCode::Darken | DriveCode::Lighten)

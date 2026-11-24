@@ -163,3 +163,40 @@ fn uniform_cleaning_codes_are_unchanged_by_board_pixel_reversal() {
         assert_eq!(&dma[320..], &[0; 16]);
     }
 }
+
+#[test]
+fn every_source_code_and_edge_survives_hal_dma_swizzle() {
+    // Exercise all four 2-bit codes, irregular ordering, and the exact
+    // first/last pixel bytes. This tests the specified HAL word permutation,
+    // not the actual polarity or ordering of electrical pins on the board.
+    let mut logical = [0u8; Panel::SCANLINE_BYTES];
+    const PATTERN: [u8; 8] = [0x1b, 0xe4, 0x39, 0x6c, 0x00, 0xff, 0xa5, 0x5a];
+    for (i, byte) in logical[..320].iter_mut().enumerate() {
+        *byte = PATTERN[(i * 3 + i / 11) % PATTERN.len()];
+    }
+    logical[0] = 0x1b;
+    logical[319] = 0xe4;
+    // Unlike a normal panel waveform, nonzero padding exposes accidental
+    // overwrites or dropped trailing samples in the transport helper.
+    for (i, byte) in logical[320..].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(17).wrapping_add(3);
+    }
+
+    let mut dma = [0xa5u8; Panel::SCANLINE_BYTES + 4];
+    assert_eq!(
+        pack_inkplate5v2_scanline(&logical, &mut dma),
+        Ok(Panel::SCANLINE_BYTES)
+    );
+    assert_eq!(&dma[Panel::SCANLINE_BYTES..], &[0xa5; 4]);
+
+    let emitted = simulated_i2s_wire(&dma[..Panel::SCANLINE_BYTES]);
+    for i in 0..320 {
+        let src = logical[319 - i];
+        let reversed = ((src & 0x03) << 6)
+            | ((src & 0x0c) << 2)
+            | ((src & 0x30) >> 2)
+            | ((src & 0xc0) >> 6);
+        assert_eq!(emitted[i], reversed, "source byte {i}");
+    }
+    assert_eq!(&emitted[320..], &logical[320..]);
+}

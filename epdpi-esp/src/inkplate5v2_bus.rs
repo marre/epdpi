@@ -661,7 +661,7 @@ mod tests {
         async(not(feature = "blocking"), keep_self)
     )]
     async fn unsafe_entry_must_not_touch_any_output_body() {
-        let mut fake = FakeI2c::fresh();
+        let fake = FakeI2c::fresh();
         // P0.7 high means the e-paper rails may still be energized.
         // Model a physical input, not the PCAL input register's stale
         // snapshot, to keep the mock faithful to the live pin override.

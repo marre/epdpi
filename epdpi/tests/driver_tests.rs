@@ -536,3 +536,67 @@ epd_test!(
     refresh_dirty_shows_what_was_drawn_then_forgets_it,
     refresh_dirty_shows_what_was_drawn_then_forgets_it_body
 );
+
+
+#[derive(Default)]
+struct FailPowerOnBus {
+    power_calls: Vec<bool>,
+}
+
+#[maybe_async_cfg::maybe(
+    sync(feature = "blocking", keep_self),
+    async(not(feature = "blocking"), keep_self)
+)]
+impl EpdParallelBus for FailPowerOnBus {
+    type Error = &'static str;
+
+    async fn set_power(&mut self, on: bool) -> Result<(), Self::Error> {
+        self.power_calls.push(on);
+        if on { Err("power-on failed") } else { Ok(()) }
+    }
+
+    async fn start_frame(&mut self) -> Result<(), Self::Error> {
+        panic!("no frame may be sent after power-on failure")
+    }
+
+    async fn write_scanline(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        panic!("no data may be sent after power-on failure")
+    }
+
+    async fn next_row(&mut self) -> Result<(), Self::Error> {
+        panic!("no gate clock may be sent after power-on failure")
+    }
+
+    async fn end_frame(&mut self) -> Result<(), Self::Error> {
+        panic!("no frame end may be sent after power-on failure")
+    }
+}
+
+#[maybe_async_cfg::maybe(
+    sync(feature = "blocking", keep_self),
+    async(not(feature = "blocking"), keep_self)
+)]
+async fn power_on_failure_attempts_shutdown_without_mutating_record_body() {
+    let mut prev = vec![0xA5u8; P::FB_BYTES];
+    let mut scanline = vec![0u8; P::SCANLINE_BYTES];
+    let mut data = vec![0xFFu8; P::FB_BYTES];
+    let fb = EpdFrameBuffer::<P>::new(&mut data).unwrap();
+
+    let mut display = EpdDisplayBuilder::<P>::new()
+        .build(FailPowerOnBus::default(), &mut prev, &mut scanline)
+        .unwrap();
+    assert_eq!(display.refresh(&fb, RefreshMode::Quality16).await, Err("power-on failed"));
+    assert_eq!(display.release().power_calls, [true, false]);
+    assert!(prev.iter().all(|&b| b == 0xA5));
+
+    let mut display = EpdDisplayBuilder::<P>::new()
+        .build(FailPowerOnBus::default(), &mut prev, &mut scanline)
+        .unwrap();
+    assert_eq!(display.clear().await, Err("power-on failed"));
+    assert_eq!(display.release().power_calls, [true, false]);
+    assert!(prev.iter().all(|&b| b == 0xA5));
+}
+epd_test!(
+    power_on_failure_attempts_shutdown_without_mutating_record,
+    power_on_failure_attempts_shutdown_without_mutating_record_body
+);

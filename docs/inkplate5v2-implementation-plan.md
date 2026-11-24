@@ -9,6 +9,15 @@ _Last revised: 2026-11-24. Working branch: `integration/inkplate-5v2-bringup`._
 - **Not yet performed:** Flash backup/recovery on the owner's device, first diagnostic execution, on-device low-voltage preparation, electrical verification or visible display updates. `set_power(true)` still returns `HardwareNotValidated` and neither new firmware mode sends a scanline.
 - **Next parallel work:** Finish the targeted I2S/waveform protocol audit in Phase 3 while the hardware owner completes Phase 1's recovery prerequisites. The first high-voltage test is a later, separately reviewed milestone.
 
+## Secondary review: additional gates (2026-11-24)
+
+The [independent second-pass review](inkplate5v2-second-pass-review.md) found additional software defects and remaining hazards. This section supersedes any implied statement that cross-compilation alone makes the hardware ready for a powered refresh.
+
+- **Implemented:** read-only low-voltage preflight **before** direct GPIO/I2S setup, stricter PGOOD/pin-state checks, separate physical PGOOD discharge verification, conservative bounded DMA **completion**, generic best-effort shutdown after failed power-on, and preservation of unknown ED052TC4 factory VCOM.
+- **Still P0 before unlocking high voltage:** the HAL's `send()` start path includes **unbounded internal waits**, and Soldered-equivalent high-Z/clock quiescence is not implemented on the actual GPIO/I2S bus.
+- **Still unverified:** actual GPIO0 pixel clock versus vendor BCK routing, source-latch window, physical rail behavior and ED052TC4 image quality. The existing firmware is intentionally non-driving.
+- The physical backup, ROM recovery and first-stage diagnostic remain prerequisites. No on-device observations were obtained during this review.
+
 ## Goal and constraints
 
 Build a reliable Rust driver for the **Soldered Inkplate 5 Gen 2** (ED052TC4, 1280 × 720 landscape, classic ESP32 WROVER-E), using the existing `epdpi` integration branch.

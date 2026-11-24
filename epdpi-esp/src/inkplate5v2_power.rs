@@ -122,6 +122,10 @@ pub enum PowerError<E> {
     ClockReadbackMismatch,
     /// PMIC reports all rails ready but the separate physical PGOOD pin is low.
     PhysicalPowerGoodLow,
+    /// The PGOOD pin is unexpectedly high before touching power/control pins.
+    PhysicalPowerGoodAlreadyHigh,
+    /// Expander P0.7 must be configured as an input to observe PGOOD.
+    PowerGoodPinNotInput,
 }
 
 /// Controls the PCAL6416A Port 0 power pins and TPS65186 high-voltage rails.
@@ -219,6 +223,31 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         })
     }
 
+    /// Read-only safety preflight, before configuring any display output
+    /// GPIO, I2S routing, or PMIC sequencer. This cannot prove that rails
+    /// are electrically off; it only rejects known dangerous states.
+    pub async fn preflight_low_voltage(&mut self) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
+        if self.state != PowerState::Uninitialized {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        let snapshot = self.inspect_expander().await?;
+        Self::verify_initial_snapshot(snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn verify_initial_snapshot(snapshot: ExpanderSnapshot) -> Result<(), PowerError<I2C::Error>> {
+        if snapshot.direction_port0 & PWR_GOOD_PIN == 0 {
+            return Err(PowerError::PowerGoodPinNotInput);
+        }
+        if snapshot.pgood_pin_high() {
+            return Err(PowerError::PhysicalPowerGoodAlreadyHigh);
+        }
+        if ((!snapshot.direction_port0) & snapshot.output_port0 & (OE | PWRUP | VCOM)) != 0 {
+            return Err(PowerError::ActiveControlPins);
+        }
+        Ok(())
+    }
+
     /// Configure the GPIO0 clock-enable expander output (Port 1, bit 0).
     ///
     /// Only callable with rails confirmed idle. Preload output HIGH before
@@ -269,11 +298,9 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         // Any failure latches Faulted, including an inconsistent initial state.
         self.state = PowerState::Faulted;
         let snapshot = self.inspect_expander().await?;
+        Self::verify_initial_snapshot(snapshot)?;
         let direction = snapshot.direction_port0;
         let outputs = snapshot.output_port0;
-        if ((!direction) & outputs & (OE | PWRUP | VCOM)) != 0 {
-            return Err(PowerError::ActiveControlPins);
-        }
         // PCAL6416A powers up with outputs HIGH. Program safe output latches
         // *before* setting direction to output, to avoid a high-going glitch.
         self.write(EXPANDER_ADDR, PCAL_OUTPUT0, &[outputs & !ALL_CONTROL]).await?;

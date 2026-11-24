@@ -28,6 +28,16 @@ The [third independent source review](inkplate5v2-third-pass-review.md) challeng
 - **Expanded test campaign:** Inject failure at each of the eight register writes during PMIC power-up and verify that the shutdown path is attempted without leaving OE/VCOM/PWRUP asserted.
 - **Still not sufficient to unlock HV:** unbounded HAL *start* waits, incomplete high-Z cleanup, and physical timing/rail uncertainty remain open. The status checks cannot catch a rail failure occurring in the middle of a scanline.
 
+## Fourth-pass contract audit: unsupported modes and row cardinality (2026-11-24)
+
+The [fourth independent review](inkplate5v2-fourth-pass-contracts.md) examined API guarantees across the panel, generic refresh engine and board bus, instead of repeating hardware-register checks.
+
+- **Fixed:** ED052TC4 no longer accepts M5 modes with empty waveform tables or the unverified generic FastMono mode. These now return `RefreshError::UnsupportedMode` before panel power, without mutating the previous-image record or dirty region.
+- **Intentional API change:** `EpdDisplay::refresh`, `refresh_rect`, `refresh_dirty` and `clear` now return `Result<(), RefreshError<BUS::Error>>`. Callers must handle `RefreshError::Bus` separately.
+- **Fixed:** ED052TC4's board bus now requires **exactly 720 completed rows** per frame. Premature frame end or an extra row faults and requests shutdown.
+- **Outstanding contract:** After any interrupted powered update, the software record may not match the glass. Differential/partial update recovery should require explicit resynchronization across driver reconstruction. This is not solved by keeping `prev_buffer` unchanged on error.
+- **Still P0:** Unbounded HAL start waits and incomplete high-Z display shutdown remain blockers to the first HV-enabled image.
+
 ## Goal and constraints
 
 Build a reliable Rust driver for the **Soldered Inkplate 5 Gen 2** (ED052TC4, 1280 × 720 landscape, classic ESP32 WROVER-E), using the existing `epdpi` integration branch.

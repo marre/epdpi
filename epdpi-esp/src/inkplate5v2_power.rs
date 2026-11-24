@@ -542,6 +542,8 @@ mod tests {
         events: Vec<Event>,
         rails_ready: bool,
         fail_sequence_write_once: bool,
+        fail_on_write_attempt: Option<usize>,
+        write_attempts: usize,
         fail_pgood_read_once: bool,
         stuck_high_after_shutdown: bool,
         pgood_pin_stuck_low: bool,
@@ -561,6 +563,8 @@ mod tests {
                 events: Vec::new(),
                 rails_ready: true,
                 fail_sequence_write_once: false,
+                fail_on_write_attempt: None,
+                write_attempts: 0,
                 fail_pgood_read_once: false,
                 stuck_high_after_shutdown: false,
                 pgood_pin_stuck_low: false,
@@ -604,6 +608,11 @@ mod tests {
                         if let Some((&first, tail)) = bytes.split_first() {
                             register = first;
                             if !tail.is_empty() {
+                                self.write_attempts += 1;
+                                if self.fail_on_write_attempt == Some(self.write_attempts) {
+                                    self.fail_on_write_attempt = None;
+                                    return Err(FakeError);
+                                }
                                 if addr == PMIC_ADDR && register == PMIC_UPSEQ0
                                     && tail[0] == 0xe4 && self.fail_sequence_write_once
                                 {
@@ -1043,6 +1052,32 @@ mod tests {
         i2c_failure_attempts_shutdown_and_latches_fault,
         i2c_failure_attempts_shutdown_and_latches_fault_body
     );
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn every_power_up_write_failure_shuts_off_controls_and_latches_body() {
+        // There are eight distinct register writes from the beginning of
+        // enable_sequence() through the OE assertion. Fail each one in
+        // isolation, then require the compensating shutdown to run.
+        for offset in 1..=8 {
+            let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+            power.initialize().await.unwrap();
+            power.configure_clock_gate().await.unwrap();
+            power.i2c.fail_on_write_attempt = Some(power.i2c.write_attempts + offset);
+            assert_eq!(power.enable().await, Err(PowerError::I2c(FakeError)), "write {offset}");
+            assert_eq!(power.state(), PowerState::Faulted, "write {offset}");
+            let (i2c, _) = power.release();
+            assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & (OE | VCOM | PWRUP), 0, "write {offset}");
+            assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0, "write {offset}");
+        }
+    }
+    run_test!(
+        every_power_up_write_failure_shuts_off_controls_and_latches,
+        every_power_up_write_failure_shuts_off_controls_and_latches_body
+    );
+
 
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),

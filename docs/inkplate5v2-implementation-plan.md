@@ -160,6 +160,8 @@ Keep this branch as the integrated hardware-validation workspace ([PR #4](https:
 
 ## References
 
+- [ED052TC4 datasheet and redistribution notice](inkplate5v2-datasheet.md)
+
 - [Deep Research: ED052TC4 specifications, timing and library alternatives](inkplate5v2-research.md) — archived research; current decisions are recorded in this plan.
 
 

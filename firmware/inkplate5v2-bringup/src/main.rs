@@ -102,7 +102,7 @@ fn main() -> ! {
 
     // Explicit experimental mode. Builds with:
     //   cargo build --release --features low-voltage-prep --target xtensa-esp32-none-elf
-    // This configures GPIO and PMIC sequencing registers while keeping HV off.
+    // This configures GPIO and reads the awake PMIC while keeping HV off.
     // DO NOT FLASH before checking the recovery instructions and original
     // read-only snapshot on the exact physical board.
     #[cfg(feature = "low-voltage-prep")]
@@ -184,6 +184,20 @@ fn main() -> ! {
             }
         }
 
+        if let Some(snapshot) = bus.power().idle_pmic_snapshot() {
+            esp_println::println!(
+                "TPS65186 standby: REVID=0x{:02X} ENABLE=0x{:02X} PG=0x{:02X} VADJ=0x{:02X}",
+                snapshot.revision, snapshot.enable, snapshot.power_good, snapshot.vadj
+            );
+            esp_println::println!(
+                "Factory VCOM={} mV (configured, not measured); VCOM1=0x{:02X} VCOM2=0x{:02X}",
+                snapshot.configured_vcom_mv(), snapshot.vcom1, snapshot.vcom2
+            );
+            esp_println::println!(
+                "Factory sequencer UP={:02X}/{:02X} DOWN={:02X}/{:02X}",
+                snapshot.upseq0, snapshot.upseq1, snapshot.dwnseq0, snapshot.dwnseq1
+            );
+        }
         loop {
             match bus.inspect() {
                 Ok(snapshot) => log_snapshot(snapshot),

@@ -34,6 +34,10 @@ const PCAL_OUTPUT1: u8 = 0x03;
 const PCAL_CONFIG0: u8 = 0x06;
 const PCAL_CONFIG1: u8 = 0x07;
 const PMIC_ENABLE: u8 = 0x01;
+const PMIC_VADJ: u8 = 0x02;
+const PMIC_VCOM1: u8 = 0x03;
+const PMIC_VCOM2: u8 = 0x04;
+const PMIC_REVID: u8 = 0x10;
 const PMIC_UPSEQ0: u8 = 0x09;
 const PMIC_DWNSEQ0: u8 = 0x0b;
 const PMIC_UPSEQ1: u8 = 0x0a;
@@ -46,6 +50,16 @@ const PGOOD_ALL_RAILS: u8 = 0xfa;
 const WAKE_DELAY_MS: u32 = 5;
 const STARTUP_TIMEOUT_MS: u16 = 500;
 const SHUTDOWN_TIMEOUT_MS: u16 = 250;
+
+// TI §8.6.13: DDLY2–4 are 6/12/24/48 ms and DFCTR can multiply
+// them by 16. Preserve the EEPROM settings but give the sequencer enough
+// time to finish, including the final 50 ms negative-boost interval.
+fn shutdown_poll_budget(down_delay: u8) -> u16 {
+    let multiplier = if down_delay & 1 != 0 { 16 } else { 1 };
+    let step = |shift: u8| 6u16 << ((down_delay >> shift) & 3);
+    let initial = if down_delay & 2 != 0 { 6 } else { 3 };
+    SHUTDOWN_TIMEOUT_MS.max(initial + multiplier * (step(2) + step(4) + step(6)) + 50 + 50)
+}
 
 const OE: u8 = 1 << 0;
 const GMOD: u8 = 1 << 1;
@@ -66,7 +80,7 @@ const PWR_GOOD_PIN: u8 = 1 << 7;
 pub enum PowerState {
     /// Hardware has not been inspected and configured yet.
     Uninitialized,
-    /// Power rails confirmed off during initialization or shutdown.
+    /// PMIC off indicators and control pins verified during initialization or shutdown.
     Idle,
     /// PGOOD verified and VCOM/OE enabled.
     On,
@@ -105,6 +119,29 @@ impl ExpanderSnapshot {
     }
 }
 
+/// Cached read-only PMIC register snapshot taken while awake with HV off.
+/// No VCOM/voltage programming, EEPROM operation or live voltage measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmicSnapshot {
+    pub enable: u8,
+    pub power_good: u8,
+    pub revision: u8,
+    pub vadj: u8,
+    pub vcom1: u8,
+    pub vcom2: u8,
+    pub upseq0: u8,
+    pub upseq1: u8,
+    pub dwnseq0: u8,
+    pub dwnseq1: u8,
+}
+
+impl PmicSnapshot {
+    /// Configured negative bias (10 mV per code), not measured voltage.
+    pub fn configured_vcom_mv(self) -> i16 {
+        -10 * i16::from(self.vcom1) - 2560 * i16::from(self.vcom2 & 1)
+    }
+}
+
 /// A power sequencing or I2C failure.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -124,7 +161,7 @@ pub enum PowerError<E> {
     PowerGoodLost(u8),
     /// Source/PMIC control signals are no longer asserted while scanning.
     PanelControlLost,
-    /// Rails did not all discharge during the bounded shutdown wait.
+    /// PMIC power-good/enable indicators did not clear during shutdown.
     DischargeTimeout(u8),
     /// Clock gate is absent or is not configured as an output.
     ClockNotEnabled,
@@ -158,6 +195,8 @@ pub struct Inkplate5v2Power<I2C, DELAY> {
     i2c: I2C,
     delay: DELAY,
     state: PowerState,
+    idle_snapshot: Option<PmicSnapshot>,
+    shutdown_budget: u16,
 }
 
 impl<I2C, DELAY> Inkplate5v2Power<I2C, DELAY> {
@@ -168,12 +207,20 @@ impl<I2C, DELAY> Inkplate5v2Power<I2C, DELAY> {
             i2c,
             delay,
             state: PowerState::Uninitialized,
+            idle_snapshot: None,
+            shutdown_budget: SHUTDOWN_TIMEOUT_MS,
         }
     }
 
     /// Current latched state. `Faulted` must not be treated as powered off.
     pub fn state(&self) -> PowerState {
         self.state
+    }
+
+    /// Most recent standby register snapshot, captured without requesting HV.
+    /// A cached value, not a live reading from the sleeping PMIC.
+    pub fn idle_pmic_snapshot(&self) -> Option<PmicSnapshot> {
+        self.idle_snapshot
     }
 
     /// Recover the owned peripheral and delay. Does not change any pins.
@@ -309,7 +356,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
     }
 
     /// Inspect the initial state, disable the six control outputs, and
-    /// initialize the PMIC sequencer. This never enables high-voltage rails.
+    /// read the awake PMIC configuration. This never requests high-voltage rails.
     ///
     /// If PWRUP/VCOM/OE are already configured as outputs and high, refuse
     /// to touch the board: it might still be powered by another firmware.
@@ -345,7 +392,8 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         // Before declaring the board idle, check that power-control
         // outputs really are low, configured as outputs, and PGOOD is low.
         let idle = self.inspect_expander().await?;
-        if idle.output_port0 & ALL_CONTROL != 0
+        if idle.input_port0 & ALL_CONTROL != 0
+            || idle.output_port0 & ALL_CONTROL != 0
             || idle.direction_port0 & ALL_CONTROL != 0
             || idle.direction_port0 & PWR_GOOD_PIN == 0
             || idle.pgood_pin_high()
@@ -367,6 +415,20 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if enable != 0 {
             return Err(PowerError::EnableReadbackMismatch(enable));
         }
+        let snapshot = PmicSnapshot {
+            enable,
+            power_good: pg,
+            revision: self.read(PMIC_ADDR, PMIC_REVID).await?,
+            vadj: self.read(PMIC_ADDR, PMIC_VADJ).await?,
+            vcom1: self.read(PMIC_ADDR, PMIC_VCOM1).await?,
+            vcom2: self.read(PMIC_ADDR, PMIC_VCOM2).await?,
+            upseq0: self.read(PMIC_ADDR, PMIC_UPSEQ0).await?,
+            upseq1: self.read(PMIC_ADDR, PMIC_UPSEQ1).await?,
+            dwnseq0: self.read(PMIC_ADDR, PMIC_DWNSEQ0).await?,
+            dwnseq1: self.read(PMIC_ADDR, PMIC_DWNSEQ1).await?,
+        };
+        self.idle_snapshot = Some(snapshot);
+        self.shutdown_budget = shutdown_poll_budget(snapshot.dwnseq1);
         // SLEEP reloads factory defaults. Do not write volatile sequencing
         // registers here only to lose them again when returning to sleep.
         Ok(())
@@ -434,6 +496,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         // EEPROM defaults. Configure the active rail order on every wake.
         let up_delay = self.read(PMIC_ADDR, PMIC_UPSEQ1).await?;
         let down_delay = self.read(PMIC_ADDR, PMIC_DWNSEQ1).await?;
+        self.shutdown_budget = shutdown_poll_budget(down_delay);
         self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0xe4, up_delay]).await?;
         self.write(PMIC_ADDR, PMIC_DWNSEQ0, &[0x1b, down_delay]).await?;
         for (reg, expected) in [
@@ -591,7 +654,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
             first = Some(e);
         }
 
-        // The manufacturer's off sequence waits up to 250 ms for PGOOD=0.
+        // Wait for PG and enable bits to clear, allowing for factory delays.
         let mut pgood = 0xff;
         let mut discharged = false;
         let mut physical_high = false;
@@ -607,14 +670,26 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if awake {
             // A failed WAKEUP transaction may have asserted the pin just now.
             self.delay.delay_ms(WAKE_DELAY_MS).await;
-            for _ in 0..SHUTDOWN_TIMEOUT_MS {
+            for _ in 0..self.shutdown_budget {
                 match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
                     Ok(0) => {
                         pgood = 0;
                         match self.inspect_expander().await {
                             Ok(snapshot) if !snapshot.pgood_pin_high() => {
-                                discharged = true;
-                                break;
+                                // PG may drop before individual enables clear.
+                                // Do not bypass the PMIC's sequencer by writing
+                                // ENABLE until all HV/VCOM enables are off.
+                                match self.read(PMIC_ADDR, PMIC_ENABLE).await {
+                                    Ok(enable) if enable & !V3P3_ENABLE == 0 => {
+                                        discharged = true;
+                                        break;
+                                    }
+                                    Ok(_) => self.delay.delay_ms(1).await,
+                                    Err(e) => {
+                                        if first.is_none() { first = Some(e); }
+                                        break;
+                                    }
+                                }
                             }
                             Ok(_) => {
                                 physical_high = true;
@@ -706,7 +781,7 @@ mod tests {
 
     struct FakeI2c {
         pcal: [u8; 8],
-        pmic: [u8; 16],
+        pmic: [u8; 17],
         events: Vec<Event>,
         rails_ready: bool,
         fail_sequence_write_once: bool,
@@ -744,8 +819,11 @@ mod tests {
             }
         }
 
-        fn sleep_defaults() -> [u8; 16] {
-            let mut registers = [0; 16];
+        fn sleep_defaults() -> [u8; 17] {
+            let mut registers = [0; 17];
+            registers[PMIC_VCOM1 as usize] = 0x2c;
+            registers[PMIC_VCOM2 as usize] = 1;
+            registers[PMIC_REVID as usize] = 0x65;
             registers[PMIC_UPSEQ1 as usize] = 0x55;
             registers[PMIC_DWNSEQ1 as usize] = 0x20;
             registers
@@ -921,6 +999,10 @@ mod tests {
         assert_eq!(power.state(), PowerState::Uninitialized);
         power.initialize().await.unwrap();
         assert_eq!(power.state(), PowerState::Idle);
+        let snapshot = power.idle_pmic_snapshot().unwrap();
+        assert_eq!(snapshot.configured_vcom_mv(), -3000);
+        assert_eq!(snapshot.revision, 0x65);
+        assert_eq!(snapshot.upseq1, 0x55);
         let (i2c, _) = power.release();
         assert_eq!(i2c.pcal[PCAL_CONFIG0 as usize] & ALL_CONTROL, 0);
         assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
@@ -1457,5 +1539,11 @@ mod tests {
     }
     run_test!(physical_pwrup_high_with_low_latch_blocks_wake,
         physical_pwrup_high_with_low_latch_blocks_wake_body);
+
+    #[test]
+    fn shutdown_budget_accounts_for_factory_delay_multiplier() {
+        assert_eq!(shutdown_poll_budget(0), SHUTDOWN_TIMEOUT_MS);
+        assert_eq!(shutdown_poll_budget(0xff), 2410);
+    }
 
 }

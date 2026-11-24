@@ -8,8 +8,10 @@ Source: [TI TPS65186 SLVSB04A](https://www.ti.com/lit/ds/symlink/tps65186.pdf), 
 - Confirm ENABLE state and physical controls before and after enabling VCOM, then enable OE. ENABLE and PG are status indicators, not voltage measurements.
 - Power-down waits for both PG indicators, verifies HV/VCOM enable bits cleared before clearing V3P3 while awake, then requests sleep. Never write ENABLE after lowering WAKEUP. On failed PG or I2C do not directly clear individual HV enable bits; request sequenced shutdown via WAKEUP. No automatic restart.
 - Mark shutdown faulted before asynchronous operations; cancellation cannot leave a reusable On state. This does not guarantee cleanup runs on cancellation.
+- The explicit low-voltage preparation now caches and logs read-only factory VCOM, VADJ, revision and sequencer registers while the PMIC is awake. The default read-only firmware still never wakes the PMIC.
+- Shutdown poll budget accounts for DFCTR and DDLY1–4, and waits for enable bits to clear as well as PG. Factory delay multiplier can extend the power-down interval past the vendor 250 ms timeout.
 - Host mock rejects I2C in sleep, restores factory delay defaults, models control input levels and reports ENABLE status. Includes repeated cycles and mismatched PWRUP latch/input regression.
 
 ## Open limitations
 
-HV stays locked. No physical board test. The fake still does not model analogue ramp/discharge, real elapsed timing, all PMIC faults or cancellation. Direct data/clock/panel high-Z release, HAL start-time timeout, diagnostics/fault capture and recovery ownership remain open. PG=0 does not measure zero volts. A 50 ms post-sleep guard is conservative and not proof of electrical discharge. Software cannot ensure external expander shutdown after loss of the I2C bus or MCU reset.
+HV stays locked. No physical board test. The fake still does not model analogue ramp/discharge, real elapsed timing, all PMIC faults or cancellation. Direct data/clock/panel high-Z release, HAL start-time timeout, fault capture and recovery ownership remain open. PG=0 does not measure zero volts. A 50 ms post-sleep guard is conservative and not proof of electrical discharge. Software cannot ensure external expander shutdown after loss of the I2C bus or MCU reset.

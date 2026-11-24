@@ -11,8 +11,8 @@
 //! Do not use this as a working display driver yet.
 //!
 //! `prepare_low_voltage()` is a separate, explicit operation that sets
-//! CKV/SPH/LE idle levels, initializes PMIC sequencer registers with rails
-//! verified off and configures PCAL Port 1's GPIO0 clock enable. This
+//! CKV/SPH/LE idle levels, reads PMIC standby registers with off indicators
+//! verified and configures PCAL Port 1's GPIO0 clock enable. This
 //! changes real low-voltage GPIO output states, so it is **not read-only**.
 //! The safer first diagnostic is `power().inspect_expander()`.
 //!
@@ -486,7 +486,7 @@ mod tests {
     struct FakeI2c {
         regs0: [u8; 8],
         pmic_enable: u8,
-        pmic_registers: [u8; 16],
+        pmic_registers: [u8; 17],
         writes: Vec<(u8, u8, u8)>,
         rails_ready: Rc<Cell<bool>>,
         physical_pgood: Rc<Cell<Option<bool>>>,
@@ -531,7 +531,7 @@ mod tests {
                                     self.regs0[usize::from(register)] = v;
                                     if self.regs0[2] & !self.regs0[6] & 0x08 == 0 {
                                         self.pmic_enable = 0;
-                                        self.pmic_registers = [0; 16];
+                                        self.pmic_registers = [0; 17];
                                     }
                                 }
                                 if addr == 0x48 {
@@ -567,7 +567,7 @@ mod tests {
                             self.pmic_enable
                                 | if controls & 0x10 != 0 { 0x0f } else { 0 }
                                 | if controls & 0x20 != 0 { 0x10 } else { 0 }
-                        } else if addr == 0x48 && register < 16 && register != 0x0f {
+                        } else if addr == 0x48 && register < 17 && register != 0x0f {
                             self.pmic_registers[usize::from(register)]
                         } else {
                             0

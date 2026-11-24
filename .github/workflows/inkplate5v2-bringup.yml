@@ -1,0 +1,51 @@
+name: Inkplate 5 Gen 2 (HV-locked board firmware)
+
+on:
+  push:
+    branches:
+      - 'integration/**'
+    paths:
+      - 'firmware/inkplate5v2-bringup/**'
+      - 'epdpi-esp/src/inkplate5v2_*.rs'
+      - 'epdpi-esp/src/i2s_parallel/**'
+      - 'epdpi-esp/src/i2s_parallel.rs'
+      - '.github/workflows/inkplate5v2-bringup.yml'
+  pull_request:
+    paths:
+      - 'firmware/inkplate5v2-bringup/**'
+      - 'epdpi-esp/src/inkplate5v2_*.rs'
+      - 'epdpi-esp/src/i2s_parallel/**'
+      - 'epdpi-esp/src/i2s_parallel.rs'
+      - '.github/workflows/inkplate5v2-bringup.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: Build classic ESP32 HV-locked bring-up
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ESP32 Xtensa toolchain
+        uses: esp-rs/xtensa-toolchain@v1.5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+      - name: Enable Cargo caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware/inkplate5v2-bringup
+      - name: Check read-only firmware
+        working-directory: firmware/inkplate5v2-bringup
+        run: cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+      - name: Check opt-in low-voltage board integration
+        working-directory: firmware/inkplate5v2-bringup
+        run: cargo build --release --features low-voltage-prep --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+      - name: Check ordinary read-only image still builds
+        working-directory: firmware/inkplate5v2-diagnostic
+        run: cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc

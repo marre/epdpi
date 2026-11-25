@@ -34,7 +34,7 @@ pub trait PowerDelay: DelayNs {
     fn now_us(&self) -> u64;
 }
 
-#[cfg(feature = "esp32")]
+#[cfg(all(feature = "esp32", feature = "blocking"))]
 impl PowerDelay for esp_hal::delay::Delay {
     fn now_us(&self) -> u64 {
         esp_hal::time::Instant::now().duration_since_epoch().as_micros()
@@ -743,9 +743,8 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         if enable != V3P3_ENABLE {
             return Err(PowerError::EnableReadbackMismatch(enable));
         }
-        self.expander_levels(PWRUP, PWRUP).await?;
-
         let started = self.delay.now_us();
+        self.expander_levels(PWRUP, PWRUP).await?;
         let mut last = 0;
         while self.before_deadline(started, STARTUP_TIMEOUT_MS) {
             last = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
@@ -919,6 +918,7 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         // VCOM_CTRL has 62.52 us of deglitch; allow the disable to
         // settle before PWRUP falling initiates rail power-down.
         self.delay.delay_ms(1).await;
+        let started = self.delay.now_us();
         if let Err(e) = self.expander_levels(PWRUP, 0).await
             && first.is_none()
         {
@@ -926,7 +926,6 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         }
 
         // Wait for PG and enable bits to clear, allowing for factory delays.
-        let started = self.delay.now_us();
         let mut pgood = 0xff;
         let mut discharged = false;
         let mut physical_high = false;

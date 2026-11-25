@@ -2118,4 +2118,59 @@ mod tests {
     run_test!(retained_power_recovery_rejects_unknown_directions,
         retained_power_recovery_rejects_unknown_directions_body);
 
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn late_good_read_cannot_enable_vcom_or_oe_body() {
+        let clock = Rc::new(Cell::new(0));
+        let mut i2c = FakeI2c::new();
+        i2c.clock = Some(clock.clone());
+        let delay = FakeDelay { clock: Some(clock), ..FakeDelay::default() };
+        let mut power = Inkplate5v2Power::new(i2c, delay);
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        // Artificially slow transactions make the first all-good reading
+        // arrive after the deadline (including the PWRUP write).
+        power.i2c.transaction_ns = 175_000_000;
+        let first = power.i2c.events.len();
+        let result = power.enable().await;
+        assert_eq!(result, Err(PowerError::PowerGoodTimeout(PGOOD_ALL_RAILS)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events[first..].iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, values) if values[0] & (OE | VCOM) != 0)));
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+    }
+    run_test!(late_good_read_cannot_enable_vcom_or_oe, late_good_read_cannot_enable_vcom_or_oe_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn shutdown_deadline_counts_i2c_time_body() {
+        let clock = Rc::new(Cell::new(0));
+        let mut i2c = FakeI2c::new();
+        i2c.clock = Some(clock.clone());
+        let delay = FakeDelay { clock: Some(clock), ..FakeDelay::default() };
+        let mut power = Inkplate5v2Power::new(i2c, delay);
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        power.enable().await.unwrap();
+        power.i2c.transaction_ns = 10_000_000;
+        power.i2c.stuck_high_after_shutdown = true;
+        let first = power.i2c.events.len();
+        let result = power.disable().await;
+        assert_eq!(result, Err(PowerError::DischargeTimeout(PGOOD_ALL_RAILS)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        let polls = i2c.events[first..].iter().filter(|e|
+            matches!(e, Event::Read(PMIC_ADDR, PMIC_PWRGOOD, _))).count();
+        assert!(polls < 30, "too many shutdown PG reads: {polls}");
+        assert!(!i2c.events[first..].iter().any(|e|
+            matches!(e, Event::Write(PMIC_ADDR, PMIC_ENABLE, _))));
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+    }
+    run_test!(shutdown_deadline_counts_i2c_time, shutdown_deadline_counts_i2c_time_body);
+
 }

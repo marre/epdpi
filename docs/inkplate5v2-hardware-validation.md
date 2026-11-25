@@ -79,18 +79,44 @@ exercised initialization, repeated rearm, fresh standby reads, clock gate
 configuration and release. Its software timings do not measure energized
 rail ramps or discharge, and readback does not establish electrical high-Z.
 
+## PMIC standby sequencer test, 2026-11-25
+
+Maintainer reported a successful `pmic-standby-check` run with the
+20 ms HAL software transaction timeout configured. The observed diagnostic
+bootloader was ESP-IDF v6.1-829-g9a97f6c54ec, ESP32 revision v3.1,
+4 MB flash, DIO at 40 MHz. The experimental factory app booted at
+0x10000 (length 0x3f0000). This identifies the current experimental
+image layout, not the original vendor firmware's partition table.
+
+```text
+Mode: PMIC STANDBY SEQUENCER CHECK; HV LOCKED
+Volatile sequencer verified: UP=E4/55 DOWN=1B/E0
+TPS65186 standby: REVID=0x66 ENABLE=0x00 PG=0x00 VADJ=0x03
+Factory VCOM=-2520 mV (configured, not measured); VCOM1=0xFC VCOM2=0x00
+Factory sequencer UP=E4/55 DOWN=1E/E0
+PASS: factory standby configuration restored; no HV, VCOM or OE request.
+PCAL INPUT0=0x00 OUTPUT0=0xC0 DIR0=0xC7
+PCAL OUTPUT1=0xFE DIR1=0xFE; PWR_GOOD=LOW CLOCK_GATE=OFF
+```
+
+Four final snapshots agreed. The volatile write/readback and subsequent
+factory reload are now verified on this unit. The factory delay and VCOM
+bytes match the previous tests. No powered rail operation or scanline was
+requested. Both [source CI](https://github.com/marre/epdpi/actions/runs/45690571489)
+and [firmware CI](https://github.com/marre/epdpi/actions/runs/45690571532)
+passed for the tested branch revision c45bbece4c4be7fae44edbcb3088dd2e5ef1c095.
+
 ## Next gate
 
-The repeated low-voltage acceptance test passed on this unit. Before
-considering a separately controlled HV diagnostic, validate the newly
-implemented I2C timeout, elapsed-time polling and shutdown-only retained
-state recovery changes. See [PMIC hardening](inkplate5v2-pmic-hardening.md). The HAL I2S start stall is a blocker for scanning
-but no DMA operation is needed for a PMIC-only test. No HV activation
-is authorized by this record; the interlock stays in place.
+All planned standby-only physical checks have passed on this unit.
+Review the ED052TC4 electrical power sequencing constraints before
+implementing a separately gated powered PMIC diagnostic. A powered test
+without scanning must still respect all panel rail, idle-signal and
+VCOM requirements; OE low alone does not establish that it is safe.
+The diagnostic must have explicit one-shot authorization, bounded
+execution, fault cleanup and no automatic restart or DMA activity.
 
-Electrical high-Z, actual HV ramp/discharge, I2S timing, HAL start stalls,
-I2C failure containment and reset behavior remain unverified.
-
-The next no-HV gate is `pmic-standby-check`, which validates volatile
-sequencer writes on the actual chip and checks factory reload after sleep.
-This test has not yet been performed. See the bring-up firmware README.
+Physical I2C fault/reset containment, electrical high-Z, actual HV
+ramp/discharge, and panel timing remain unverified. The HAL I2S start
+stall remains a blocker for scanning. No HV activation is authorized by
+this record; the existing interlock remains in place.

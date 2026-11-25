@@ -1226,7 +1226,7 @@ mod tests {
         wake_started_ns: u64,
         rail_started_ns: u64,
         rail_stopped_ns: Option<u64>,
-        logic_disabled_ns: Option<u64>,
+        logic_off_after_rail_request_ns: Option<u64>,
         factory_down_delay: u8,
         write_attempts: usize,
         fail_pgood_read_once: bool,
@@ -1257,7 +1257,7 @@ mod tests {
                 wake_started_ns: 0,
                 rail_started_ns: 0,
                 rail_stopped_ns: None,
-                logic_disabled_ns: None,
+                logic_off_after_rail_request_ns: None,
                 factory_down_delay: 0x20,
                 write_attempts: 0,
                 fail_pgood_read_once: false,
@@ -1386,7 +1386,8 @@ mod tests {
                                         }
                                     } else if addr == PMIC_ADDR {
                                         if index == PMIC_ENABLE as usize && *value == 0 {
-                                            self.logic_disabled_ns = Some(self.now_ns());
+                                            self.logic_off_after_rail_request_ns = self.rail_stopped_ns
+                                                .map(|start| self.now_ns() - start);
                                         }
                                         self.pmic[index] = *value;
                                     } else {
@@ -2120,9 +2121,7 @@ mod tests {
             let start = clock.get();
             power.disable().await.unwrap();
             assert!(clock.get() - start >= 850_000_000);
-            let logic_off = power.i2c.logic_disabled_ns.unwrap();
-            let rails_off = power.i2c.rail_stopped_ns.unwrap();
-            assert!(logic_off - rails_off >= 800_000_000);
+            assert!(power.i2c.logic_off_after_rail_request_ns.unwrap() >= 800_000_000);
             assert_eq!(power.state(), PowerState::Idle);
         }
     }

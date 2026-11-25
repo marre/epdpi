@@ -192,6 +192,10 @@ pub enum PowerError<E> {
     /// Some control pins were actively driven high on entry; refuse to
     /// reconfigure a potentially powered display without an explicit recovery.
     ActiveControlPins,
+    /// Retained controls were contained during boot; do not continue boot.
+    RetainedPowerContained,
+    /// Standby settings did not survive a wake/sleep cycle unchanged.
+    FactorySnapshotChanged,
     /// PGOOD was unexpectedly nonzero when initializing with rails disabled.
     RailsAlreadyOn(u8),
     /// Not all rails became good within the startup timeout.
@@ -367,6 +371,35 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         let snapshot = self.inspect_expander().await?;
         Self::verify_initial_snapshot(snapshot)?;
         Ok(snapshot)
+    }
+
+    /// Opt-in startup preflight for a firmware that owns the board.
+    /// Read-only on a clean boot; otherwise attempt shutdown of known
+    /// retained outputs and return an error even after successful recovery.
+    /// Call before constructing any direct panel GPIO or DMA resources.
+    pub async fn boot_preflight(&mut self) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
+        if self.state != PowerState::Uninitialized {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        let snapshot = match self.inspect_expander().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.state = PowerState::Faulted;
+                return Err(error);
+            }
+        };
+        let clean = Self::verify_initial_snapshot(snapshot);
+        let clock_active = (snapshot.input_port1
+            | (!snapshot.direction_port1 & snapshot.output_port1)) & GPIO0_ENABLE != 0;
+        if clean.is_ok() && !clock_active {
+            return Ok(snapshot);
+        }
+        if snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN {
+            self.state = PowerState::Faulted;
+            return Err(clean.err().unwrap_or(PowerError::LowVoltageReadbackMismatch));
+        }
+        self.recover_retained_power().await?;
+        Err(PowerError::RetainedPowerContained)
     }
 
     fn verify_initial_snapshot(snapshot: ExpanderSnapshot) -> Result<(), PowerError<I2C::Error>> {
@@ -705,19 +738,9 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         Ok(())
     }
 
-    async fn enable_sequence(&mut self) -> Result<(), PowerError<I2C::Error>> {
-        // Soldered's einkOn: GMOD/SPV high, OE low, before PMIC power-up.
-        self.expander_levels(OE | GMOD | SPV | VCOM | PWRUP, GMOD | SPV).await?;
-        self.expander_levels(WAKEUP, WAKEUP).await?;
-        self.delay.delay_ms(WAKE_DELAY_MS).await;
-        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
-        if pg != 0 {
-            return Err(PowerError::RailsAlreadyOn(pg));
-        }
-        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
-        if enable != 0 {
-            return Err(PowerError::EnableReadbackMismatch(enable));
-        }
+    // Shared by active power-up and the standby-only diagnostic.
+    // Caller has already verified ENABLE=0, PG=0 and safe control levels.
+    async fn program_awake_sequencer(&mut self) -> Result<[u8; 4], PowerError<I2C::Error>> {
         // Preserve factory-loaded delay values. The vendor's begin() writes
         // are lost in sleep; its effective active-cycle delays are the
         // EEPROM defaults. Configure the active rail order on every wake.
@@ -738,6 +761,89 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
                 return Err(PowerError::SequencerReadbackMismatch);
             }
         }
+        Ok([0xe4, up_delay, 0x1b, down_delay])
+    }
+
+    /// Single standby-only sequencer check. No panel HV, VCOM, OE, clock
+    /// gate enable, or DMA operations. Only volatile sequence registers
+    /// are written. Compare fresh factory snapshots before and after sleep.
+    /// Requires successful boot preflight and exclusive board ownership.
+    pub async fn check_standby_sequencer(&mut self) -> Result<[u8; 4], PowerError<I2C::Error>> {
+        self.boot_preflight().await?;
+        self.initialize().await?;
+        let baseline = self.idle_snapshot.ok_or(PowerError::FactorySnapshotChanged)?;
+        self.state = PowerState::Faulted;
+        let result = self.standby_sequencer_inner().await;
+        if result.is_err() {
+            // Never wake a sleeping PMIC to clean up a failed operation.
+            let _ = self.shutdown_sequence().await;
+            let _ = self.disable_clock_gate().await;
+            return result;
+        }
+        // Return to sleep before reading the factory defaults afresh.
+        self.expander_levels(WAKEUP, 0).await?;
+        self.delay.delay_ms(50).await;
+        let idle = self.inspect_expander().await?;
+        Self::verify_initial_snapshot(idle)?;
+        if idle.direction_port0 & ALL_CONTROL != 0
+            || idle.output_port0 & ALL_CONTROL != 0
+        {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        self.inspect_standby_and_sleep().await?;
+        if self.idle_snapshot != Some(baseline) {
+            return Err(PowerError::FactorySnapshotChanged);
+        }
+        self.state = PowerState::Idle;
+        self.release_panel_controls().await?;
+        result
+    }
+
+    async fn standby_sequencer_inner(&mut self) -> Result<[u8; 4], PowerError<I2C::Error>> {
+        self.inspect_awake_idle().await?;
+        self.verify_standby_controls().await?;
+        let programmed = self.program_awake_sequencer().await?;
+        self.verify_standby_controls().await?;
+        self.verify_no_pmic_fault().await?;
+        Ok(programmed)
+    }
+
+    async fn verify_standby_controls(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        let snapshot = self.inspect_expander().await?;
+        if snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN
+            || snapshot.output_port0 & ALL_CONTROL != WAKEUP
+            || snapshot.input_port0 & ALL_CONTROL != WAKEUP
+            || snapshot.pgood_pin_high()
+            || (snapshot.input_port1 | (!snapshot.direction_port1 & snapshot.output_port1))
+                & GPIO0_ENABLE != 0
+        {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+        if pg != 0 {
+            return Err(PowerError::RailsAlreadyOn(pg));
+        }
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable != 0 {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
+        Ok(())
+    }
+
+    async fn enable_sequence(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        // Soldered's einkOn: GMOD/SPV high, OE low, before PMIC power-up.
+        self.expander_levels(OE | GMOD | SPV | VCOM | PWRUP, GMOD | SPV).await?;
+        self.expander_levels(WAKEUP, WAKEUP).await?;
+        self.delay.delay_ms(WAKE_DELAY_MS).await;
+        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+        if pg != 0 {
+            return Err(PowerError::RailsAlreadyOn(pg));
+        }
+        let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
+        if enable != 0 {
+            return Err(PowerError::EnableReadbackMismatch(enable));
+        }
+        self.program_awake_sequencer().await?;
         self.write(PMIC_ADDR, PMIC_ENABLE, &[V3P3_ENABLE]).await?;
         let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
         if enable != V3P3_ENABLE {
@@ -2172,5 +2278,68 @@ mod tests {
         assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
     }
     run_test!(shutdown_deadline_counts_i2c_time, shutdown_deadline_counts_i2c_time_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn boot_preflight_contains_retained_active_state_body() {
+        let mut original = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        original.initialize().await.unwrap();
+        original.configure_clock_gate().await.unwrap();
+        original.enable().await.unwrap();
+        let (mut i2c, _) = original.release();
+        i2c.events.clear();
+        let mut recovered = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        let result = recovered.boot_preflight().await;
+        assert_eq!(result, Err(PowerError::RetainedPowerContained));
+        assert_eq!(recovered.state(), PowerState::Faulted);
+        let (i2c, _) = recovered.release();
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+        assert_eq!(i2c.pcal[PCAL_OUTPUT1 as usize] & GPIO0_ENABLE, 0);
+    }
+    run_test!(boot_preflight_contains_retained_active_state, boot_preflight_contains_retained_active_state_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn clean_boot_preflight_never_writes_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        power.boot_preflight().await.unwrap();
+        assert_eq!(power.state(), PowerState::Uninitialized);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+    }
+    run_test!(clean_boot_preflight_never_writes, clean_boot_preflight_never_writes_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn standby_sequencer_writes_only_volatile_order_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        let programmed = power.check_standby_sequencer().await.unwrap();
+        assert_eq!(programmed, [0xe4, 0x55, 0x1b, 0x20]);
+        let factory = power.idle_pmic_snapshot().unwrap();
+        assert_eq!(factory.configured_vcom_mv(), -3000);
+        assert_eq!(factory.upseq0, 0);
+        assert_eq!(factory.dwnseq0, 0);
+        let snapshot = power.inspect_expander().await.unwrap();
+        assert_eq!(snapshot.direction_port0 & ALL_CONTROL, PANEL_CONTROL);
+        assert_eq!(snapshot.input_port0 & (PMIC_CONTROL | PWR_GOOD_PIN), 0);
+        assert!(!snapshot.clock_enabled());
+        let (i2c, _) = power.release();
+        let writes: Vec<_> = i2c.events.iter().filter_map(|event| match event {
+            Event::Write(PMIC_ADDR, reg, values) => Some((*reg, values.as_slice())),
+            _ => None,
+        }).collect();
+        assert_eq!(writes, [(PMIC_UPSEQ0, &[0xe4, 0x55][..]),
+            (PMIC_DWNSEQ0, &[0x1b, 0x20][..])]);
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, values)
+                if values[0] & (OE | GMOD | SPV | PWRUP | VCOM) != 0)));
+    }
+    run_test!(standby_sequencer_writes_only_volatile_order, standby_sequencer_writes_only_volatile_order_body);
 
 }

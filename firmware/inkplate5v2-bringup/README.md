@@ -13,6 +13,7 @@ Experimental classic ESP32 WROVER-E (Inkplate 5V2 / ED052TC4) firmware linking
 | Default | `cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc` | Reads only PCAL6416A registers over I2C, prints snapshots over UART |
 | `low-voltage-prep` | Same command with `--features low-voltage-prep` | Performs one preparation/shutdown cycle, including read-only PMIC standby inspection, with HV disabled |
 | `low-voltage-cycles` | Same command with `--features low-voltage-cycles` | Runs 100 preparation/shutdown cycles on one bus instance, then stays in the released state |
+| `pmic-standby-check` | Same command with `--features pmic-standby-check` | Tests volatile PMIC sequencing writes while awake with all rails disabled; no display GPIO or DMA |
 
 This is intentionally a separate workspace from the independent
 `firmware/inkplate5v2-diagnostic`. The first-stage diagnostic does not
@@ -22,7 +23,9 @@ In all these firmware modes, **panel HV is never requested**:
 `Inkplate5v2Bus::set_power(true)` still rejects requests with
 `HardwareNotValidated`. I2S DMA is constructed only in the opt-in mode;
 it sends no display rows. The opt-in builds **do** modify hardware pins and wake the PMIC, but do not
-write its register configuration. They are not substitutes for read-only diagnostics.
+write its register configuration in the low-voltage modes. The PMIC standby
+check explicitly writes only volatile sequencer registers. These are not
+substitutes for read-only diagnostics.
 
 The UART is the board's CH340C serial bridge. A 5-second snapshot shows
 PCAL input/output levels and configurations, including P0.7 PGOOD and
@@ -33,7 +36,9 @@ The opt-in build performs a **read-only preflight before configuring any
 display control outputs or I2S pins**. It rejects asserted physical PGOOD,
 an incorrectly configured PGOOD input, or an actively driven PCAL power/control
 output (including WAKEUP, GMOD and SPV). Its board library repeats that check
-before changing direct GPIO. A failed setup halts rather than retrying.
+before changing direct GPIO. A failed setup halts rather than retrying. On a dirty boot with a known
+configured expander, the opt-in modes attempt shutdown-only containment
+before halting. The default image remains strictly read-only.
 
 **Unresolved before activating display high voltage:** the HAL's I2S
 `send()` start code still has unbounded waits, I2C can stall, and arbitrary
@@ -61,6 +66,19 @@ then stays released and prints snapshots every five seconds. Any error
 stops the test; do not repeatedly reset on failure. Capture the entire
 serial log. Expected final line begins `PASS: 100/100 low-voltage cycles`.
 No HV or DMA row transfers are requested.
+
+## PMIC-only standby check
+
+After the 100-cycle test passes, this independent opt-in mode verifies
+the same sequence register writes used by future power-up, without
+writing ENABLE or asserting PWRUP/VCOM/OE. It never configures direct
+display pins, the clock gate stays off and no I2S is instantiated.
+The factory snapshot is read again after sleep and must match the
+initial snapshot exactly. Use the same flash procedure as above, replacing
+the feature with `pmic-standby-check`. Expected output includes
+`Volatile sequencer verified: UP=E4/55 DOWN=1B/E0` on the tested unit,
+then the original factory `UP=E4/55 DOWN=1E/E0` and a PASS line.
+Do not enable or attempt a powered refresh based on this test.
 
 ## Design notes
 

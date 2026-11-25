@@ -25,10 +25,12 @@ use esp_hal::{
 };
 
 #[cfg(feature = "low-voltage-prep")]
-use epdpi_esp::{
-    inkplate5v2_bus::{Inkplate5v2Bus, Inkplate5v2DirectPins, Inkplate5v2Tx},
-    inkplate5v2_power::PmicSnapshot,
-};
+use epdpi_esp::inkplate5v2_bus::{Inkplate5v2Bus, Inkplate5v2DirectPins, Inkplate5v2Tx};
+#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
+use epdpi_esp::inkplate5v2_power::PmicSnapshot;
+
+#[cfg(all(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
+compile_error!("Select either low-voltage preparation or the PMIC-only standby check.");
 
 #[cfg(feature = "low-voltage-prep")]
 use esp_hal::{
@@ -56,7 +58,7 @@ fn log_snapshot(snapshot: ExpanderSnapshot) {
     esp_println::println!("PGOOD is a logic reading, NOT a physical rail-voltage measurement.");
 }
 
-#[cfg(feature = "low-voltage-prep")]
+#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
 fn halt() -> ! {
     loop { core::hint::spin_loop(); }
 }
@@ -75,7 +77,7 @@ fn check_transition(initial: ExpanderSnapshot, actual: ExpanderSnapshot, release
         && actual.input_port1 & 1 == u8::from(!released)
 }
 
-#[cfg(feature = "low-voltage-prep")]
+#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
 fn log_pmic(snapshot: PmicSnapshot) {
     esp_println::println!(
         "TPS65186 standby: REVID=0x{:02X} ENABLE=0x{:02X} PG=0x{:02X} VADJ=0x{:02X}",
@@ -121,7 +123,7 @@ fn main() -> ! {
 
     // Default build: create NO display output pins, I2S, or PMIC writes.
     // The read-only first-stage diagnostic remains independently buildable.
-    #[cfg(not(feature = "low-voltage-prep"))]
+    #[cfg(not(any(feature = "low-voltage-prep", feature = "pmic-standby-check")))]
     {
         esp_println::println!("Mode: READ ONLY (no PCAL output/configuration register writes)");
         let mut power = power;
@@ -129,6 +131,34 @@ fn main() -> ! {
             match power.inspect_expander() {
                 Ok(snapshot) => log_snapshot(snapshot),
                 Err(error) => esp_println::println!("Read-only inspection failed: {error:?}"),
+            }
+            wait_for_next_snapshot();
+        }
+    }
+
+    // This mode never constructs any display GPIO or I2S resource.
+    #[cfg(feature = "pmic-standby-check")]
+    {
+        let mut power = power;
+        esp_println::println!("Mode: PMIC STANDBY SEQUENCER CHECK; HV LOCKED");
+        match power.check_standby_sequencer() {
+            Ok([up, up_delay, down, down_delay]) => {
+                esp_println::println!("Volatile sequencer verified: UP={up:02X}/{up_delay:02X} DOWN={down:02X}/{down_delay:02X}");
+                if let Some(snapshot) = power.idle_pmic_snapshot() { log_pmic(snapshot); }
+                esp_println::println!("PASS: factory standby configuration restored; no HV, VCOM or OE request.");
+            }
+            Err(error) => {
+                esp_println::println!("PMIC standby check failed: {error:?}. Halted; no automatic retry.");
+                halt();
+            }
+        }
+        loop {
+            match power.inspect_expander() {
+                Ok(snapshot) => log_snapshot(snapshot),
+                Err(error) => {
+                    esp_println::println!("Post-check inspection failed: {error:?}. Halted.");
+                    halt();
+                }
             }
             wait_for_next_snapshot();
         }
@@ -147,10 +177,10 @@ fn main() -> ! {
         // First record the state as found. The power controller will refuse
         // to initialize if the existing OE/PWRUP/VCOM pins are actively HIGH.
         let mut power = power;
-        let initial = match power.inspect_expander() {
+        let initial = match power.boot_preflight() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                esp_println::println!("Initial PCAL inspection failed: {error:?}. Halted.");
+                esp_println::println!("Boot containment/preflight stopped: {error:?}. No display GPIO or I2S configured. Halted.");
                 loop { core::hint::spin_loop(); }
             }
         };

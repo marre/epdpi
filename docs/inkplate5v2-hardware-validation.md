@@ -90,3 +90,7 @@ is authorized by this record; the interlock stays in place.
 
 Electrical high-Z, actual HV ramp/discharge, I2S timing, HAL start stalls,
 I2C failure containment and reset behavior remain unverified.
+
+The next no-HV gate is `pmic-standby-check`, which validates volatile
+sequencer writes on the actual chip and checks factory reload after sleep.
+This test has not yet been performed. See the bring-up firmware README.

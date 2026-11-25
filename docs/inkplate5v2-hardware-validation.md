@@ -40,13 +40,53 @@ bytes are retained as reference observations for this unit, not global
 constants for other panels. The single-cycle firmware did not write PMIC
 calibration or sequencer registers.
 
+## Repeated low-voltage test, 2026-11-25
+
+Maintainer reported a complete 100-cycle run using the explicit
+`low-voltage-cycles` firmware. No reboot between cycles, no failures,
+and no requests to enable HV or send display data. The fresh PMIC
+standby snapshot was identical across all 100 cycles, including the
+previously recorded VCOM and sequencer settings.
+
+| Register | Prepared | Released |
+| --- | --- | --- |
+| PCAL INPUT0 | 0x00 | 0x00 |
+| PCAL OUTPUT0 | 0xC0 | 0xC0 |
+| PCAL DIR0 | 0xC0 | 0xC7 |
+| PCAL OUTPUT1 | 0xFF | 0xFE |
+| PCAL DIR1 | 0xFE | 0xFE |
+| PWR_GOOD | LOW | LOW |
+| Clock gate | ON | OFF |
+
+| Software timing | Prepare | Shutdown |
+| --- | --- | --- |
+| First cycle | 34688 us | 15403 us |
+| All cycles, minimum | 30478 us | 15136 us |
+| All cycles, maximum | 34688 us | 15403 us |
+| Cycles 3 through 100, range | 30478-30483 us | 15136-15141 us |
+
+```text
+PASS cycle 100/100: prep=30479 us shutdown=15137 us
+PASS: 100/100 low-voltage cycles; PMIC configuration unchanged; HV never enabled.
+Preparation min/max: 30478/34688 us; shutdown min/max: 15136/15403 us
+Panel GPIO shutdown complete; no further cycles.
+PCAL INPUT0=0x00 OUTPUT0=0xC0 DIR0=0xC7
+PCAL OUTPUT1=0xFE DIR1=0xFE; PWR_GOOD=LOW CLOCK_GATE=OFF
+```
+
+The final snapshot was stable across repeated serial reports. The test
+exercised initialization, repeated rearm, fresh standby reads, clock gate
+configuration and release. Its software timings do not measure energized
+rail ramps or discharge, and readback does not establish electrical high-Z.
+
 ## Next gate
 
-Run the explicit `low-voltage-cycles` firmware on the same unit. Expect
-100/100 passes, unchanged standby PMIC configuration on each fresh read,
-and a stable released state after the final cycle. Record the complete
-serial log. No result for this test has been reported yet.
+The repeated low-voltage acceptance test passed on this unit. Before
+considering a separately controlled HV diagnostic, review the I2C
+transaction timeout, elapsed-time polling deadlines and fault containment
+including MCU reset. The HAL I2S start stall is a blocker for scanning
+but no DMA operation is needed for a PMIC-only test. No HV activation
+is authorized by this record; the interlock stays in place.
 
 Electrical high-Z, actual HV ramp/discharge, I2S timing, HAL start stalls,
-I2C failure containment and reset behavior remain unverified. Keep the HV
-interlock in place.
+I2C failure containment and reset behavior remain unverified.

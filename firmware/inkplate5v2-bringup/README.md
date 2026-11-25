@@ -72,7 +72,7 @@ No HV or DMA row transfers are requested.
   GPIO4, 5, 18, 19, 23, 25, 26, 27.
 - DMA capacity: 336 bytes per row (320 source data + 16 padding clocks).
 - Existing `esp-hal` I2S driver is retained; no DMA rewrite.
-- Initial read-only and one-cycle low-voltage tests passed on the maintainer's physical board (reported 2026-11-25). No electrical measurements or HV tests have been performed. See the [hardware log](../../docs/inkplate5v2-hardware-validation.md).
+- Initial read-only, one-cycle and 100/100 repeated low-voltage tests passed on the maintainer's physical board (reported 2026-11-25). No electrical measurements or HV tests have been performed. See the [hardware log](../../docs/inkplate5v2-hardware-validation.md).
 
 For the stages after low-voltage integration see the
 [implementation plan](../../docs/inkplate5v2-implementation-plan.md).

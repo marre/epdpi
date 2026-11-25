@@ -76,7 +76,7 @@ display pins, the clock gate stays off and no I2S is instantiated.
 The factory snapshot is read again after sleep and must match the
 initial snapshot exactly. Use the same flash procedure as above, replacing
 the feature with `pmic-standby-check`. Expected output includes
-`Volatile sequencer verified: UP=E4/55 DOWN=1B/E0` on the tested unit,
+`Volatile sequencer verified: UP=E4/55 DOWN=1E/E0` on the tested unit (the earlier 1B test is historical),
 then the original factory `UP=E4/55 DOWN=1E/E0` and a PASS line.
 Do not enable or attempt a powered refresh based on this test.
 

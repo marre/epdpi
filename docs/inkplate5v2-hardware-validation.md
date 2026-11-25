@@ -120,3 +120,5 @@ Physical I2C fault/reset containment, electrical high-Z, actual HV
 ramp/discharge, and panel timing remain unverified. The HAL I2S start
 stall remains a blocker for scanning. No HV activation is authorized by
 this record; the existing interlock remains in place.
+
+Follow-up source review selected the panel-specific E4/1E sequence instead of the vendor E4/1B override, and added a logic-supply settling dwell. The earlier E4/1B diagnostic result is retained as historical evidence, not the current expected programmed order. No energized operation has been tested. See the PMIC hardening notes.

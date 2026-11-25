@@ -75,6 +75,13 @@ const PGOOD_ALL_RAILS: u8 = 0xfa;
 const WAKE_DELAY_MS: u32 = 5;
 const STARTUP_TIMEOUT_MS: u16 = 500;
 const SHUTDOWN_TIMEOUT_MS: u16 = 250;
+// ED052TC4 §7: VGL must decay last. Keep the factory rail order,
+// not the generic vendor library's 0x1b override (VNEG last).
+const UP_SEQUENCE: u8 = 0xe4;
+const DOWN_SEQUENCE: u8 = 0x1e;
+// Conservative extra dwell after digital off indicators, before removing
+// VDD. This does NOT establish the physical VGL decay rate.
+const PANEL_SETTLE_MS: u32 = 500;
 
 // TI §8.6.13: DDLY2–4 are 6/12/24/48 ms and DFCTR can multiply
 // them by 16. Preserve the EEPROM settings but give the sequencer enough
@@ -751,17 +758,17 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         let up_delay = self.read(PMIC_ADDR, PMIC_UPSEQ1).await?;
         let down_delay = self.read(PMIC_ADDR, PMIC_DWNSEQ1).await?;
         self.shutdown_budget = shutdown_poll_budget(down_delay);
-        self.write(PMIC_ADDR, PMIC_UPSEQ0, &[0xe4, up_delay]).await?;
-        self.write(PMIC_ADDR, PMIC_DWNSEQ0, &[0x1b, down_delay]).await?;
+        self.write(PMIC_ADDR, PMIC_UPSEQ0, &[UP_SEQUENCE, up_delay]).await?;
+        self.write(PMIC_ADDR, PMIC_DWNSEQ0, &[DOWN_SEQUENCE, down_delay]).await?;
         for (reg, expected) in [
-            (PMIC_UPSEQ0, 0xe4), (PMIC_UPSEQ1, up_delay),
-            (PMIC_DWNSEQ0, 0x1b), (PMIC_DWNSEQ1, down_delay),
+            (PMIC_UPSEQ0, UP_SEQUENCE), (PMIC_UPSEQ1, up_delay),
+            (PMIC_DWNSEQ0, DOWN_SEQUENCE), (PMIC_DWNSEQ1, down_delay),
         ] {
             if self.read(PMIC_ADDR, reg).await? != expected {
                 return Err(PowerError::SequencerReadbackMismatch);
             }
         }
-        Ok([0xe4, up_delay, 0x1b, down_delay])
+        Ok([UP_SEQUENCE, up_delay, DOWN_SEQUENCE, down_delay])
     }
 
     /// Single standby-only sequencer check. No panel HV, VCOM, OE, clock
@@ -857,6 +864,9 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         if enable != V3P3_ENABLE {
             return Err(PowerError::EnableReadbackMismatch(enable));
         }
+        // ED052TC4 §7 requires VDD before the source/gate supplies.
+        // This guard is relative to the enable readback, not a VDD measurement.
+        self.delay.delay_ms(1).await;
         let started = self.delay.now_us();
         self.expander_levels(PWRUP, PWRUP).await?;
         let mut last = 0;
@@ -882,6 +892,16 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
                         || !snapshot.clock_enabled()
                     {
                         return Err(PowerError::PanelControlLost);
+                    }
+                    // Allow settling after the last rail reports ready.
+                    self.delay.delay_ms(1).await;
+                    if !self.before_deadline(started, STARTUP_TIMEOUT_MS) {
+                        return Err(PowerError::PowerGoodTimeout(last));
+                    }
+                    if self.read(PMIC_ADDR, PMIC_PWRGOOD).await? != PGOOD_ALL_RAILS
+                        || !self.before_deadline(started, STARTUP_TIMEOUT_MS)
+                    {
+                        return Err(PowerError::PowerGoodTimeout(last));
                     }
                     self.expander_levels(VCOM, VCOM).await?;
                     // Allow VCOM_CTRL deglitch (TI pin specification).
@@ -1005,6 +1025,22 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         result
     }
 
+    async fn verify_off_then_disable_logic(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        let snapshot = self.inspect_expander().await?;
+        if snapshot.input_port0 & ALL_CONTROL != WAKEUP
+            || snapshot.output_port0 & ALL_CONTROL != WAKEUP
+            || snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN
+            || snapshot.pgood_pin_high()
+        {
+            return Err(PowerError::PanelControlLost);
+        }
+        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+        if pg != 0 {
+            return Err(PowerError::DischargeTimeout(pg));
+        }
+        self.disable_logic_supply().await
+    }
+
     async fn disable_logic_supply(&mut self) -> Result<(), PowerError<I2C::Error>> {
         let enable = self.read(PMIC_ADDR, PMIC_ENABLE).await?;
         if enable & !V3P3_ENABLE != 0 {
@@ -1024,6 +1060,8 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         if let Err(e) = self.expander_levels(OE | GMOD | SPV, 0).await {
             first = Some(e);
         }
+        // Keep the data/scan suppression interval before removing VCOM.
+        self.delay.delay_ms(1).await;
         if let Err(e) = self.expander_levels(VCOM, 0).await
             && first.is_none()
         {
@@ -1107,7 +1145,12 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
             // ENABLE bits reflect actual rail state. Never clear individual
             // HV bits while a sequenced shutdown may still be in progress.
             if discharged {
-                let disabled = self.disable_logic_supply().await;
+                // Keep VDD enabled during the additional settling interval.
+                // In standby-only cleanup ENABLE is already zero; the
+                // conservative dwell is harmless there too. Never use this
+                // delay as proof of analogue discharge.
+                self.delay.delay_ms(PANEL_SETTLE_MS).await;
+                let disabled = self.verify_off_then_disable_logic().await;
                 if let Err(e) = disabled
                     && first.is_none()
                 {
@@ -1183,6 +1226,7 @@ mod tests {
         wake_started_ns: u64,
         rail_started_ns: u64,
         rail_stopped_ns: Option<u64>,
+        logic_disabled_ns: Option<u64>,
         factory_down_delay: u8,
         write_attempts: usize,
         fail_pgood_read_once: bool,
@@ -1213,6 +1257,7 @@ mod tests {
                 wake_started_ns: 0,
                 rail_started_ns: 0,
                 rail_stopped_ns: None,
+                logic_disabled_ns: None,
                 factory_down_delay: 0x20,
                 write_attempts: 0,
                 fail_pgood_read_once: false,
@@ -1340,6 +1385,9 @@ mod tests {
                                             self.rail_stopped_ns = None;
                                         }
                                     } else if addr == PMIC_ADDR {
+                                        if index == PMIC_ENABLE as usize && *value == 0 {
+                                            self.logic_disabled_ns = Some(self.now_ns());
+                                        }
                                         self.pmic[index] = *value;
                                     } else {
                                         return Err(FakeError);
@@ -1984,7 +2032,7 @@ mod tests {
             power.enable().await.unwrap();
             assert_eq!(power.read(PMIC_ADDR, PMIC_UPSEQ0).await.unwrap(), 0xe4);
             assert_eq!(power.read(PMIC_ADDR, PMIC_UPSEQ1).await.unwrap(), 0x55);
-            assert_eq!(power.read(PMIC_ADDR, PMIC_DWNSEQ0).await.unwrap(), 0x1b);
+            assert_eq!(power.read(PMIC_ADDR, PMIC_DWNSEQ0).await.unwrap(), 0x1e);
             assert_eq!(power.read(PMIC_ADDR, PMIC_DWNSEQ1).await.unwrap(), 0x20);
             power.disable().await.unwrap();
             assert_eq!(power.state(), PowerState::Idle);
@@ -2071,7 +2119,10 @@ mod tests {
             assert!(clock.get() - start >= 33_000_000);
             let start = clock.get();
             power.disable().await.unwrap();
-            assert!(clock.get() - start >= 350_000_000);
+            assert!(clock.get() - start >= 850_000_000);
+            let logic_off = power.i2c.logic_disabled_ns.unwrap();
+            let rails_off = power.i2c.rail_stopped_ns.unwrap();
+            assert!(logic_off - rails_off >= 800_000_000);
             assert_eq!(power.state(), PowerState::Idle);
         }
     }
@@ -2185,7 +2236,8 @@ mod tests {
         let polls = i2c.events[first..].iter().filter(|e|
             matches!(e, Event::Read(PMIC_ADDR, PMIC_PWRGOOD, _))).count();
         assert!(polls < 65, "too many PG reads: {polls}");
-        assert!(delay.total_ns < 200_000_000);
+        // Exclude the intentional settling dwell from the poll budget check.
+        assert!(delay.total_ns < 700_000_000);
         assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
     }
     run_test!(polling_deadline_counts_i2c_time, polling_deadline_counts_i2c_time_body);
@@ -2328,7 +2380,7 @@ mod tests {
     async fn standby_sequencer_writes_only_volatile_order_body() {
         let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
         let programmed = power.check_standby_sequencer().await.unwrap();
-        assert_eq!(programmed, [0xe4, 0x55, 0x1b, 0x20]);
+        assert_eq!(programmed, [0xe4, 0x55, 0x1e, 0x20]);
         let factory = power.idle_pmic_snapshot().unwrap();
         assert_eq!(factory.configured_vcom_mv(), -3000);
         assert_eq!(factory.upseq0, 0);
@@ -2343,7 +2395,7 @@ mod tests {
             _ => None,
         }).collect();
         assert_eq!(writes, [(PMIC_UPSEQ0, &[0xe4, 0x55][..]),
-            (PMIC_DWNSEQ0, &[0x1b, 0x20][..])]);
+            (PMIC_DWNSEQ0, &[0x1e, 0x20][..])]);
         assert!(!i2c.events.iter().any(|event| matches!(event,
             Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, values)
                 if values[0] & (OE | GMOD | SPV | PWRUP | VCOM) != 0)));

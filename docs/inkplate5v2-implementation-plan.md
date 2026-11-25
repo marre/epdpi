@@ -38,6 +38,17 @@ The [fourth independent review](inkplate5v2-fourth-pass-contracts.md) examined A
 - **Outstanding contract:** After any interrupted powered update, the software record may not match the glass. Differential/partial update recovery should require explicit resynchronization across driver reconstruction. This is not solved by keeping `prev_buffer` unchanged on error.
 - **Still P0:** Unbounded HAL start waits and incomplete high-Z display shutdown remain blockers to the first HV-enabled image.
 
+## Electrical sequencing review (2026-11-25)
+
+Recovery and all planned standby tests have passed on the actual board; see
+[hardware validation](inkplate5v2-hardware-validation.md). The detailed
+[PMIC hardening notes](inkplate5v2-pmic-hardening.md) document the new
+panel-specific E4/1E ordering and logic supply settling dwell. Earlier
+E4/1B results are historical. The panel's actual VGL decay timing and
+rail/logic relationships remain unverified without instrumentation.
+Do not automatically advance to an energized test solely on the basis
+of serial readback. The public HV interlock remains intact.
+
 ## Goal and constraints
 
 Build a reliable Rust driver for the **Soldered Inkplate 5 Gen 2** (ED052TC4, 1280 × 720 landscape, classic ESP32 WROVER-E), using the existing `epdpi` integration branch.

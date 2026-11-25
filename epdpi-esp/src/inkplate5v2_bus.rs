@@ -686,6 +686,8 @@ mod tests {
         writes: Vec<(u8, u8, u8)>,
         rails_ready: Rc<Cell<bool>>,
         physical_pgood: Rc<Cell<Option<bool>>>,
+        standby_reads: Rc<Cell<usize>>,
+        factory_vcom1: Rc<Cell<u8>>,
         trace: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
     impl FakeI2c {
@@ -697,6 +699,8 @@ mod tests {
                 writes: Vec::new(),
                 rails_ready: Rc::new(Cell::new(false)),
                 physical_pgood: Rc::new(Cell::new(None)),
+                standby_reads: Rc::new(Cell::new(0)),
+                factory_vcom1: Rc::new(Cell::new(0xfc)),
                 trace: None,
             };
             // All 16 expander pins are inputs at power-on.
@@ -786,6 +790,11 @@ mod tests {
                             self.pmic_enable
                                 | if controls & 0x10 != 0 { 0x0f } else { 0 }
                                 | if controls & 0x20 != 0 { 0x10 } else { 0 }
+                        } else if addr == 0x48 && register == 0x10 {
+                            self.standby_reads.set(self.standby_reads.get() + 1);
+                            0x66
+                        } else if addr == 0x48 && register == 0x03 {
+                            self.factory_vcom1.get()
                         } else if addr == 0x48 && register < 17 && register != 0x0f {
                             self.pmic_registers[usize::from(register)]
                         } else {
@@ -1337,5 +1346,46 @@ mod tests {
         }
     }
     run_both!(shutdown_order_and_uncertain_rail_containment, shutdown_order_and_uncertain_rail_containment_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn repeated_low_voltage_cycles_read_fresh_pmic_snapshot_body() {
+        let fake = FakeI2c::fresh();
+        let reads = fake.standby_reads.clone();
+        let calibration = fake.factory_vcom1.clone();
+        let mut b = bus_with_i2c(fake);
+        for cycle in 1..=100 {
+            // Deliberately change the simulated factory value once. A stale
+            // cache would hide this from the on-device acceptance test.
+            if cycle == 50 {
+                calibration.set(0xfb);
+            }
+            b.prepare_low_voltage().await.unwrap();
+            let snapshot = b.power().idle_pmic_snapshot().unwrap();
+            assert_eq!(snapshot.vcom1, calibration.get());
+            assert_eq!(snapshot.enable, 0);
+            assert_eq!(snapshot.power_good, 0);
+            assert_eq!(reads.get(), cycle);
+            let prepared = b.inspect().await.unwrap();
+            assert!(prepared.clock_enabled());
+            assert_eq!(prepared.input_port0 & 0xbf, 0);
+            b.shutdown_panel().await.unwrap();
+            let released = b.inspect().await.unwrap();
+            assert_eq!(released.direction_port0 & 0xbf, 0x87);
+            assert!(!released.clock_enabled());
+            assert!(b.tx.released);
+        }
+        let (tx, power, _) = b.release();
+        let (i2c, _) = power.release();
+        assert_eq!(tx.transmissions, 0);
+        assert!(!i2c.writes.iter().any(|&(address, _, _)| address == 0x48));
+        assert!(!i2c.writes.iter().any(|&(address, register, value)|
+            address == 0x20 && register == 2 && value & 0x31 != 0
+        ));
+    }
+    run_both!(repeated_low_voltage_cycles_read_fresh_pmic_snapshot,
+        repeated_low_voltage_cycles_read_fresh_pmic_snapshot_body);
 
 }

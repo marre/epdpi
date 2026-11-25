@@ -3,7 +3,7 @@
 Experimental classic ESP32 WROVER-E (Inkplate 5V2 / ED052TC4) firmware linking
 `epdpi-esp`'s real Inkplate board/power implementation.
 
-> **Do not flash yet.** Follow [the flash backup and ROM recovery procedure](../../docs/inkplate5v2-recovery.md)
+> Before flashing, follow [the flash backup and ROM recovery procedure](../../docs/inkplate5v2-recovery.md)
 > on your actual board first. A successful build does not prove hardware safety.
 
 ## Modes
@@ -11,13 +11,14 @@ Experimental classic ESP32 WROVER-E (Inkplate 5V2 / ED052TC4) firmware linking
 | Mode | Build command | Board behavior |
 | --- | --- | --- |
 | Default | `cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc` | Reads only PCAL6416A registers over I2C, prints snapshots over UART |
-| `low-voltage-prep` | Same command with `--features low-voltage-prep` | Initializes direct GPIO, I2S1 clock/data routing and the PMIC sequencer with panel high-voltage disabled |
+| `low-voltage-prep` | Same command with `--features low-voltage-prep` | Performs one preparation/shutdown cycle, including read-only PMIC standby inspection, with HV disabled |
+| `low-voltage-cycles` | Same command with `--features low-voltage-cycles` | Runs 100 preparation/shutdown cycles on one bus instance, then stays in the released state |
 
 This is intentionally a separate workspace from the independent
 `firmware/inkplate5v2-diagnostic`. The first-stage diagnostic does not
 link any display library and should remain the safest first firmware test.
 
-In either mode, there is **no source-code path that turns on panel HV**:
+In all these firmware modes, **panel HV is never requested**:
 `Inkplate5v2Bus::set_power(true)` still rejects requests with
 `HardwareNotValidated`. I2S DMA is constructed only in the opt-in mode;
 it sends no display rows. The opt-in build **does** modify hardware pins and
@@ -35,10 +36,31 @@ output (including WAKEUP, GMOD and SPV). Its board library repeats that check
 before changing direct GPIO. A failed setup halts rather than retrying.
 
 **Unresolved before activating display high voltage:** the HAL's I2S
-`send()` start code still has unbounded waits (only transfer completion is
-now time-limited), and source/clock/data high-Z shutdown is not fully
-implemented. These are documented in the
-[second-pass review](../../docs/inkplate5v2-second-pass-review.md).
+`send()` start code still has unbounded waits, I2C can stall, and arbitrary
+cancellation/reset cannot guarantee cleanup. GPIO high-Z shutdown is
+implemented but its electrical behavior remains unmeasured. See the
+[PMIC hardening notes](../../docs/inkplate5v2-pmic-hardening.md).
+
+## Repeated low-voltage test
+
+Only after the read-only and single-cycle tests succeed, build and flash
+with the verified backup/recovery procedure (adjust the serial port):
+
+```sh
+cargo +esp build --release --features low-voltage-cycles \\
+  --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+espflash flash --chip esp32 --port /dev/ttyUSB0 --monitor \\
+  target/xtensa-esp32-none-elf/release/inkplate5v2-bringup
+```
+
+The firmware reads the PMIC afresh on each wake, compares all standby
+registers against the first cycle, verifies prepared and released PCAL
+states including unrelated latch/direction preservation, and logs each
+cycle plus minimum/maximum durations. It waits 100 ms between cycles,
+then stays released and prints snapshots every five seconds. Any error
+stops the test; do not repeatedly reset on failure. Capture the entire
+serial log. Expected final line begins `PASS: 100/100 low-voltage cycles`.
+No HV or DMA row transfers are requested.
 
 ## Design notes
 
@@ -50,7 +72,7 @@ implemented. These are documented in the
   GPIO4, 5, 18, 19, 23, 25, 26, 27.
 - DMA capacity: 336 bytes per row (320 source data + 16 padding clocks).
 - Existing `esp-hal` I2S driver is retained; no DMA rewrite.
-- **No physical boot or electrical validation has been performed.**
+- Initial read-only and one-cycle low-voltage tests passed on the maintainer's physical board (reported 2026-11-25). No electrical measurements or HV tests have been performed. See the [hardware log](../../docs/inkplate5v2-hardware-validation.md).
 
 For the stages after low-voltage integration see the
 [implementation plan](../../docs/inkplate5v2-implementation-plan.md).

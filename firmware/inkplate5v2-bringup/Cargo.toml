@@ -15,6 +15,7 @@ description = "Staged, high-voltage-locked Inkplate 5 Gen 2 ESP32 bring-up firmw
 [features]
 default = []
 low-voltage-prep = []
+low-voltage-cycles = ["low-voltage-prep"]
 
 [dependencies]
 epdpi-esp = { path = "../../epdpi-esp", default-features = false, features = ["blocking", "esp32"] }

@@ -1,8 +1,8 @@
 # Inkplate 5 Gen 2 — backup and recovery before the first flash
 
-> **No hardware execution is verified. Do not flash the experimental
-> diagnostic image until ROM recovery and an original full-flash backup
-> have been confirmed for your specific board.**
+> **Confirm ROM recovery and an original full-flash backup for your specific
+> board before flashing.** The maintainer reported successful flash and restore
+> on one physical unit; see [hardware validation](inkplate5v2-hardware-validation.md).
 
 This procedure concerns the **classic ESP32 WROVER-E** Inkplate 5 Gen 2
 (V1.1.0 schematic), **not** an ESP32-S3 board. The diagnostic firmware

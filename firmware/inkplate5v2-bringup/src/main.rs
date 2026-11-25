@@ -27,6 +27,7 @@ use esp_hal::{
 #[cfg(feature = "low-voltage-prep")]
 use epdpi_esp::{
     inkplate5v2_bus::{Inkplate5v2Bus, Inkplate5v2DirectPins, Inkplate5v2Tx},
+    inkplate5v2_power::PmicSnapshot,
 };
 
 #[cfg(feature = "low-voltage-prep")]
@@ -53,6 +54,41 @@ fn log_snapshot(snapshot: ExpanderSnapshot) {
         if snapshot.clock_enabled() { "ON" } else { "OFF" }
     );
     esp_println::println!("PGOOD is a logic reading, NOT a physical rail-voltage measurement.");
+}
+
+#[cfg(feature = "low-voltage-prep")]
+fn halt() -> ! {
+    loop { core::hint::spin_loop(); }
+}
+
+#[cfg(feature = "low-voltage-prep")]
+fn check_transition(initial: ExpanderSnapshot, actual: ExpanderSnapshot, released: bool) -> bool {
+    // Preserve unrelated output latches and directions; ignore unrelated
+    // input levels and the floating OE/GMOD/SPV levels after release.
+    let input_mask = if released { 0xb8 } else { 0xbf };
+    actual.input_port0 & input_mask == 0
+        && actual.output_port0 == initial.output_port0 & !0x3f
+        && actual.direction_port0 == (initial.direction_port0 & !0x3f) | if released { 7 } else { 0 }
+        && actual.direction_port0 & 0x80 != 0
+        && actual.output_port1 == (initial.output_port1 & !1) | u8::from(!released)
+        && actual.direction_port1 == initial.direction_port1 & !1
+        && actual.input_port1 & 1 == u8::from(!released)
+}
+
+#[cfg(feature = "low-voltage-prep")]
+fn log_pmic(snapshot: PmicSnapshot) {
+    esp_println::println!(
+        "TPS65186 standby: REVID=0x{:02X} ENABLE=0x{:02X} PG=0x{:02X} VADJ=0x{:02X}",
+        snapshot.revision, snapshot.enable, snapshot.power_good, snapshot.vadj
+    );
+    esp_println::println!(
+        "Factory VCOM={} mV (configured, not measured); VCOM1=0x{:02X} VCOM2=0x{:02X}",
+        snapshot.configured_vcom_mv(), snapshot.vcom1, snapshot.vcom2
+    );
+    esp_println::println!(
+        "Factory sequencer UP={:02X}/{:02X} DOWN={:02X}/{:02X}",
+        snapshot.upseq0, snapshot.upseq1, snapshot.dwnseq0, snapshot.dwnseq1
+    );
 }
 
 fn wait_for_next_snapshot() {
@@ -158,38 +194,97 @@ fn main() -> ! {
         let tx = Inkplate5v2Tx::new(peripherals.I2S1, peripherals.DMA_I2S1, tx_buffer, pixel_pins);
         let mut bus = Inkplate5v2Bus::new(tx, power, pins);
 
-        match bus.prepare_low_voltage() {
-            Ok(()) => esp_println::println!(
-                "Low-voltage preparation succeeded; panel HV remains LOCKED."
-            ),
-            Err(error) => {
-                esp_println::println!("Low-voltage preparation failed: {error:?}. Halted.");
-                // The bus latches the error. Do not retry or silently assume
-                // the physical rails were discharged successfully.
-                loop { core::hint::spin_loop(); }
+        let cycles = if cfg!(feature = "low-voltage-cycles") { 100 } else { 1 };
+        let mut baseline: Option<PmicSnapshot> = None;
+        let mut prep_min = u64::MAX;
+        let mut prep_max = 0u64;
+        let mut off_min = u64::MAX;
+        let mut off_max = 0u64;
+        esp_println::println!("Low-voltage cycle test: {cycles} cycle(s); HV locked.");
+        for cycle in 1..=cycles {
+            let started = Instant::now();
+            if let Err(error) = bus.prepare_low_voltage() {
+                esp_println::println!("Cycle {cycle}/{cycles} preparation failed: {error:?}. Halted.");
+                halt();
             }
+            let prep_us = started.elapsed().as_micros();
+            // Do not return early on a diagnostic mismatch before attempting
+            // shutdown. The PMIC is asleep and HV has never been requested.
+            let prepared = bus.inspect();
+            let pmic = bus.power().idle_pmic_snapshot();
+            let prepared_ok = match prepared {
+                Ok(snapshot) => {
+                    if cycle == 1 { log_snapshot(snapshot); }
+                    let ok = check_transition(initial, snapshot, false);
+                    if !ok {
+                        esp_println::println!("Cycle {cycle}/{cycles} unexpected prepared registers:");
+                        log_snapshot(snapshot);
+                    }
+                    ok
+                }
+                Err(error) => {
+                    esp_println::println!("Cycle {cycle}/{cycles} prepared inspection failed: {error:?}");
+                    false
+                }
+            };
+            let pmic_ok = match pmic {
+                Some(snapshot) => {
+                    if let Some(reference) = baseline {
+                        if snapshot != reference {
+                            esp_println::println!("Cycle {cycle}/{cycles} PMIC standby configuration changed:");
+                            log_pmic(snapshot);
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        baseline = Some(snapshot);
+                        log_pmic(snapshot);
+                        snapshot.enable == 0 && snapshot.power_good == 0
+                    }
+                }
+                None => {
+                    esp_println::println!("Cycle {cycle}/{cycles} missing fresh PMIC snapshot");
+                    false
+                }
+            };
+            let started = Instant::now();
+            if let Err(error) = bus.shutdown_panel() {
+                esp_println::println!("Cycle {cycle}/{cycles} shutdown failed: {error:?}. Halted.");
+                halt();
+            }
+            let off_us = started.elapsed().as_micros();
+            let released_ok = match bus.inspect() {
+                Ok(snapshot) => {
+                    if cycle == 1 || cycle == cycles { log_snapshot(snapshot); }
+                    let ok = check_transition(initial, snapshot, true);
+                    if !ok {
+                        esp_println::println!("Cycle {cycle}/{cycles} unexpected released registers:");
+                        log_snapshot(snapshot);
+                    }
+                    ok
+                }
+                Err(error) => {
+                    esp_println::println!("Cycle {cycle}/{cycles} released inspection failed: {error:?}");
+                    false
+                }
+            };
+            if !prepared_ok || !pmic_ok || !released_ok {
+                esp_println::println!("FAIL: cycle {cycle}/{cycles}; no further cycles. Halted.");
+                halt();
+            }
+            prep_min = prep_min.min(prep_us);
+            prep_max = prep_max.max(prep_us);
+            off_min = off_min.min(off_us);
+            off_max = off_max.max(off_us);
+            esp_println::println!("PASS cycle {cycle}/{cycles}: prep={prep_us} us shutdown={off_us} us");
+            // Let the PMIC settle in sleep between cycles. This is a
+            // low-voltage diagnostic interval, not an HV discharge proof.
+            if cycle < cycles { Delay::new().delay_millis(100); }
         }
-
-        if let Some(snapshot) = bus.power().idle_pmic_snapshot() {
-            esp_println::println!(
-                "TPS65186 standby: REVID=0x{:02X} ENABLE=0x{:02X} PG=0x{:02X} VADJ=0x{:02X}",
-                snapshot.revision, snapshot.enable, snapshot.power_good, snapshot.vadj
-            );
-            esp_println::println!(
-                "Factory VCOM={} mV (configured, not measured); VCOM1=0x{:02X} VCOM2=0x{:02X}",
-                snapshot.configured_vcom_mv(), snapshot.vcom1, snapshot.vcom2
-            );
-            esp_println::println!(
-                "Factory sequencer UP={:02X}/{:02X} DOWN={:02X}/{:02X}",
-                snapshot.upseq0, snapshot.upseq1, snapshot.dwnseq0, snapshot.dwnseq1
-            );
-        }
-        // Exercise the same shutdown path used after a refresh, with HV
-        // never enabled. The diagnostic then stays in the released state.
-        match bus.shutdown_panel() {
-            Ok(()) => esp_println::println!("Panel GPIO shutdown complete; HV never enabled."),
-            Err(error) => esp_println::println!("Panel GPIO shutdown failed: {error:?}"),
-        }
+        esp_println::println!("PASS: {cycles}/{cycles} low-voltage cycles; PMIC configuration unchanged; HV never enabled.");
+        esp_println::println!("Preparation min/max: {prep_min}/{prep_max} us; shutdown min/max: {off_min}/{off_max} us");
+        esp_println::println!("Panel GPIO shutdown complete; no further cycles.");
         loop {
             match bus.inspect() {
                 Ok(snapshot) => log_snapshot(snapshot),

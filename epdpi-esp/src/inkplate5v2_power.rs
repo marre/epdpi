@@ -408,6 +408,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if check.direction_port0 & ALL_CONTROL != 0 || check.output_port0 & ALL_CONTROL != 0 {
             return Err(PowerError::LowVoltageReadbackMismatch);
         }
+        self.inspect_standby_and_sleep().await?;
         self.state = PowerState::Idle;
         Ok(())
     }
@@ -510,25 +511,42 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if idle.direction_port0 & ALL_CONTROL != 0 {
             return Err(PowerError::LowVoltageReadbackMismatch);
         }
+        self.inspect_standby_and_sleep().await?;
+        self.state = PowerState::Idle;
+        Ok(())
+    }
+
+    // Both initial preparation and rearm take a fresh standby snapshot.
+    // Never expose an earlier successful snapshot after a failed wake.
+    async fn inspect_standby_and_sleep(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        self.idle_snapshot = None;
         let checked = self.inspect_awake_idle().await;
         // Even if WAKEUP assertion failed after reaching the expander,
         // attempt to deassert it. Never access PMIC registers after sleep.
         let asleep = self.expander_levels(WAKEUP, 0).await;
-        checked?;
-        asleep?;
+        if let Err(error) = checked.and(asleep) {
+            self.idle_snapshot = None;
+            return Err(error);
+        }
         // A successful I2C ACK is not proof the configuration latched.
         // Before declaring the board idle, check that power-control
         // outputs really are low, configured as outputs, and PGOOD is low.
-        let idle = self.inspect_expander().await?;
+        let idle = match self.inspect_expander().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.idle_snapshot = None;
+                return Err(error);
+            }
+        };
         if idle.input_port0 & ALL_CONTROL != 0
             || idle.output_port0 & ALL_CONTROL != 0
             || idle.direction_port0 & ALL_CONTROL != 0
             || idle.direction_port0 & PWR_GOOD_PIN == 0
             || idle.pgood_pin_high()
         {
+            self.idle_snapshot = None;
             return Err(PowerError::LowVoltageReadbackMismatch);
         }
-        self.state = PowerState::Idle;
         Ok(())
     }
 

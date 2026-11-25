@@ -46,6 +46,9 @@ jobs:
       - name: Check opt-in low-voltage board integration
         working-directory: firmware/inkplate5v2-bringup
         run: cargo build --release --features low-voltage-prep --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+      - name: Check repeated low-voltage cycle firmware
+        working-directory: firmware/inkplate5v2-bringup
+        run: cargo build --release --features low-voltage-cycles --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
       - name: Check ordinary read-only image still builds
         working-directory: firmware/inkplate5v2-diagnostic
         run: cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc

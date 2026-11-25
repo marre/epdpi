@@ -773,13 +773,21 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         self.initialize().await?;
         let baseline = self.idle_snapshot.ok_or(PowerError::FactorySnapshotChanged)?;
         self.state = PowerState::Faulted;
-        let result = self.standby_sequencer_inner().await;
+        let result = self.standby_sequencer_check_and_release(baseline).await;
         if result.is_err() {
-            // Never wake a sleeping PMIC to clean up a failed operation.
+            self.state = PowerState::Faulted;
+            // Never wake a sleeping PMIC to clean up a failed operation,
+            // including an ambiguous WAKEUP-low write or failed readback.
             let _ = self.shutdown_sequence().await;
             let _ = self.disable_clock_gate().await;
-            return result;
         }
+        result
+    }
+
+    async fn standby_sequencer_check_and_release(
+        &mut self, baseline: PmicSnapshot,
+    ) -> Result<[u8; 4], PowerError<I2C::Error>> {
+        let programmed = self.standby_sequencer_inner().await?;
         // Return to sleep before reading the factory defaults afresh.
         self.expander_levels(WAKEUP, 0).await?;
         self.delay.delay_ms(50).await;
@@ -796,7 +804,7 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         }
         self.state = PowerState::Idle;
         self.release_panel_controls().await?;
-        result
+        Ok(programmed)
     }
 
     async fn standby_sequencer_inner(&mut self) -> Result<[u8; 4], PowerError<I2C::Error>> {
@@ -2341,5 +2349,26 @@ mod tests {
                 if values[0] & (OE | GMOD | SPV | PWRUP | VCOM) != 0)));
     }
     run_test!(standby_sequencer_writes_only_volatile_order, standby_sequencer_writes_only_volatile_order_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn standby_sequencer_write_failure_contains_power_body() {
+        let mut i2c = FakeI2c::new();
+        i2c.fail_sequence_write_once = true;
+        let mut power = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        let result = power.check_standby_sequencer().await;
+        assert_eq!(result, Err(PowerError::I2c(FakeError)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+        assert_eq!(i2c.pcal[PCAL_OUTPUT1 as usize] & GPIO0_ENABLE, 0);
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, values)
+                if values[0] & (OE | GMOD | SPV | PWRUP | VCOM) != 0)));
+    }
+    run_test!(standby_sequencer_write_failure_contains_power,
+        standby_sequencer_write_failure_contains_power_body);
 
 }

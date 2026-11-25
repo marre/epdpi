@@ -19,7 +19,7 @@ use esp_backtrace as _;
 use epdpi_esp::inkplate5v2_power::{ExpanderSnapshot, Inkplate5v2Power};
 use esp_hal::{
     delay::Delay,
-    i2c::master::{Config as I2cConfig, I2c},
+    i2c::master::{Config as I2cConfig, I2c, SoftwareTimeout},
     main,
     time::{Duration, Instant},
 };
@@ -107,7 +107,8 @@ fn main() -> ! {
     esp_println::println!("High-voltage and display scanning are DISABLED.");
     esp_println::println!("Before flashing, verify the original full-flash backup and ROM recovery.");
 
-    let i2c = match I2c::new(peripherals.I2C0, I2cConfig::default()) {
+    let i2c = match I2c::new(peripherals.I2C0, I2cConfig::default()
+        .with_software_timeout(SoftwareTimeout::Transaction(Duration::from_millis(20)))) {
         Ok(i2c) => i2c
             .with_sda(peripherals.GPIO21)
             .with_scl(peripherals.GPIO22),

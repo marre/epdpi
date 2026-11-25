@@ -11,7 +11,7 @@
 
 use esp_backtrace as _;
 use esp_hal::{
-    i2c::master::{Config as I2cConfig, I2c},
+    i2c::master::{Config as I2cConfig, I2c, SoftwareTimeout},
     main,
     time::{Duration, Instant},
 };
@@ -38,7 +38,8 @@ fn main() -> ! {
     esp_println::println!("I2C0 SDA=GPIO21 SCL=GPIO22 (verify board revision).");
 
     // Only SDA and SCL are configured. These default to I2C open-drain.
-    let mut i2c = match I2c::new(peripherals.I2C0, I2cConfig::default()) {
+    let mut i2c = match I2c::new(peripherals.I2C0, I2cConfig::default()
+        .with_software_timeout(SoftwareTimeout::Transaction(Duration::from_millis(20)))) {
         Ok(i2c) => i2c
             .with_sda(peripherals.GPIO21)
             .with_scl(peripherals.GPIO22),

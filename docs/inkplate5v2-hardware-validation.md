@@ -82,9 +82,9 @@ rail ramps or discharge, and readback does not establish electrical high-Z.
 ## Next gate
 
 The repeated low-voltage acceptance test passed on this unit. Before
-considering a separately controlled HV diagnostic, review the I2C
-transaction timeout, elapsed-time polling deadlines and fault containment
-including MCU reset. The HAL I2S start stall is a blocker for scanning
+considering a separately controlled HV diagnostic, validate the newly
+implemented I2C timeout, elapsed-time polling and shutdown-only retained
+state recovery changes. See [PMIC hardening](inkplate5v2-pmic-hardening.md). The HAL I2S start stall is a blocker for scanning
 but no DMA operation is needed for a PMIC-only test. No HV activation
 is authorized by this record; the interlock stays in place.
 

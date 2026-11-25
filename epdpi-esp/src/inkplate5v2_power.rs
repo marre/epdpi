@@ -26,6 +26,21 @@ use embedded_hal::{delay::DelayNs, i2c::I2c};
 #[cfg(not(feature = "blocking"))]
 use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 
+/// Delay provider with a monotonic elapsed-time source. I2C operations and
+/// scheduler delays must advance this clock, not just explicit delay calls.
+/// Implementations must provide a nondecreasing microsecond counter for
+/// the duration of a power operation.
+pub trait PowerDelay: DelayNs {
+    fn now_us(&self) -> u64;
+}
+
+#[cfg(feature = "esp32")]
+impl PowerDelay for esp_hal::delay::Delay {
+    fn now_us(&self) -> u64 {
+        esp_hal::time::Instant::now().duration_since_epoch().as_micros()
+    }
+}
+
 const EXPANDER_ADDR: u8 = 0x20;
 const PMIC_ADDR: u8 = 0x48;
 const PCAL_INPUT0: u8 = 0x00;
@@ -271,7 +286,11 @@ impl<I2C, DELAY> Inkplate5v2Power<I2C, DELAY> {
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
+impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
+    fn before_deadline(&self, started: u64, budget_ms: u16) -> bool {
+        self.delay.now_us().saturating_sub(started) < u64::from(budget_ms) * 1000
+    }
+
     async fn read(&mut self, address: u8, register: u8) -> Result<u8, PowerError<I2C::Error>> {
         let mut value = [0];
         self.i2c
@@ -484,6 +503,45 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         result
     }
 
+    /// Shutdown-only recovery of a previously configured expander after
+    /// MCU reset. Call before any scan GPIO/I2S configuration, and only
+    /// with exclusive board ownership. Does not enable or rearm anything.
+    ///
+    /// Refuses unknown/mixed pin directions, unreliable input configuration
+    /// or a sleeping PMIC: software cannot certify discharge in those cases.
+    /// Even success leaves this controller Faulted; a separate recovery
+    /// decision is required before any subsequent use.
+    pub async fn recover_retained_power(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        if self.state != PowerState::Uninitialized {
+            return Err(PowerError::InvalidState(self.state));
+        }
+        self.state = PowerState::Faulted;
+        // Use the worst possible factory delay: no trustworthy snapshot
+        // survives an MCU reset. Never assert WAKEUP during recovery.
+        self.shutdown_budget = shutdown_poll_budget(0xff);
+        let snapshot = self.inspect_expander().await?;
+        if snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN {
+            return Err(PowerError::LowVoltageReadbackMismatch);
+        }
+        let result = self.shutdown_sequence().await;
+        // Gate off after attempted shutdown even on PMIC error. Do not
+        // release expander panel controls or permit any restart.
+        let clock_off = self.disable_clock_gate().await;
+        result.and(clock_off)
+    }
+
+    async fn disable_clock_gate(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        let output = self.read(EXPANDER_ADDR, PCAL_OUTPUT1).await?;
+        let direction = self.read(EXPANDER_ADDR, PCAL_CONFIG1).await?;
+        self.write(EXPANDER_ADDR, PCAL_OUTPUT1, &[output & !GPIO0_ENABLE]).await?;
+        self.write(EXPANDER_ADDR, PCAL_CONFIG1, &[direction & !GPIO0_ENABLE]).await?;
+        let check = self.inspect_expander().await?;
+        if (check.input_port1 | check.output_port1 | check.direction_port1) & GPIO0_ENABLE != 0 {
+            return Err(PowerError::ClockReadbackMismatch);
+        }
+        Ok(())
+    }
+
     /// Inspect the initial state, disable the six control outputs, and
     /// read the awake PMIC configuration. This never requests high-voltage rails.
     ///
@@ -687,14 +745,21 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         }
         self.expander_levels(PWRUP, PWRUP).await?;
 
+        let started = self.delay.now_us();
         let mut last = 0;
-        for _ in 0..STARTUP_TIMEOUT_MS {
+        while self.before_deadline(started, STARTUP_TIMEOUT_MS) {
             last = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+            if !self.before_deadline(started, STARTUP_TIMEOUT_MS) {
+                return Err(PowerError::PowerGoodTimeout(last));
+            }
             if last == PGOOD_ALL_RAILS {
                 // Both independent indicators must agree; allow the PCAL
                 // input to settle until the bounded startup deadline rather
                 // than faulting on a transient disagreement.
                 let snapshot = self.inspect_expander().await?;
+                if !self.before_deadline(started, STARTUP_TIMEOUT_MS) {
+                    return Err(PowerError::PowerGoodTimeout(last));
+                }
                 if snapshot.pgood_pin_high() {
                     let expected = GMOD | SPV | WAKEUP | PWRUP;
                     if snapshot.direction_port0 & ALL_CONTROL != 0
@@ -861,6 +926,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         }
 
         // Wait for PG and enable bits to clear, allowing for factory delays.
+        let started = self.delay.now_us();
         let mut pgood = 0xff;
         let mut discharged = false;
         let mut physical_high = false;
@@ -876,7 +942,7 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
         if awake {
             // A failed WAKEUP transaction may have asserted the pin just now.
             self.delay.delay_ms(WAKE_DELAY_MS).await;
-            for _ in 0..self.shutdown_budget {
+            while self.before_deadline(started, self.shutdown_budget) {
                 match self.read(PMIC_ADDR, PMIC_PWRGOOD).await {
                     Ok(0) => {
                         pgood = 0;
@@ -886,7 +952,8 @@ impl<I2C: I2c, DELAY: DelayNs> Inkplate5v2Power<I2C, DELAY> {
                                 // Do not bypass the PMIC's sequencer by writing
                                 // ENABLE until all HV/VCOM enables are off.
                                 match self.read(PMIC_ADDR, PMIC_ENABLE).await {
-                                    Ok(enable) if enable & !V3P3_ENABLE == 0 => {
+                                    Ok(enable) if enable & !V3P3_ENABLE == 0
+                                        && self.before_deadline(started, self.shutdown_budget) => {
                                         discharged = true;
                                         break;
                                     }
@@ -999,6 +1066,7 @@ mod tests {
         fail_on_write_attempt: Option<usize>,
         fail_after_write_attempt: Option<usize>,
         clock: Option<Rc<Cell<u64>>>,
+        transaction_ns: u64,
         wake_started_ns: u64,
         rail_started_ns: u64,
         rail_stopped_ns: Option<u64>,
@@ -1028,6 +1096,7 @@ mod tests {
                 fail_on_write_attempt: None,
                 fail_after_write_attempt: None,
                 clock: None,
+                transaction_ns: 0,
                 wake_started_ns: 0,
                 rail_started_ns: 0,
                 rail_stopped_ns: None,
@@ -1104,6 +1173,9 @@ mod tests {
             addr: u8,
             operations: &mut [Operation<'_>],
         ) -> Result<(), Self::Error> {
+            if let Some(clock) = &self.clock {
+                clock.set(clock.get() + self.transaction_ns);
+            }
             if addr == PMIC_ADDR
                 && (self.physical_controls() & WAKEUP == 0
                     || (self.clock.is_some() && self.now_ns() - self.wake_started_ns < 1_800_000))
@@ -1235,6 +1307,12 @@ mod tests {
         suspend_once: bool,
     }
 
+    impl PowerDelay for FakeDelay {
+        fn now_us(&self) -> u64 {
+            self.clock.as_ref().map_or(self.total_ns, |clock| clock.get()) / 1000
+        }
+    }
+
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),
         async(not(feature = "blocking"), keep_self)
@@ -1248,7 +1326,7 @@ mod tests {
             }
             self.total_ns += u64::from(ns);
             if let Some(clock) = &self.clock {
-                clock.set(self.total_ns);
+                clock.set(clock.get() + u64::from(ns));
             }
         }
     }
@@ -1970,5 +2048,75 @@ mod tests {
         }
     }
     run_test!(unsafe_vcom_modes_prevent_rail_startup, unsafe_vcom_modes_prevent_rail_startup_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn polling_deadline_counts_i2c_time_body() {
+        let clock = Rc::new(Cell::new(0));
+        let mut i2c = FakeI2c::new();
+        i2c.clock = Some(clock.clone());
+        i2c.transaction_ns = 10_000_000;
+        i2c.rails_ready = false;
+        let delay = FakeDelay { clock: Some(clock), ..FakeDelay::default() };
+        let mut power = Inkplate5v2Power::new(i2c, delay);
+        power.initialize().await.unwrap();
+        power.configure_clock_gate().await.unwrap();
+        let first = power.i2c.events.len();
+        let result = power.enable().await;
+        assert_eq!(result, Err(PowerError::PowerGoodTimeout(0)));
+        let (i2c, delay) = power.release();
+        // Iteration-count polling would wait ~5.5 seconds here. The ramp
+        // phase consumes its real 500 ms budget, including I2C latency.
+        let polls = i2c.events[first..].iter().filter(|e|
+            matches!(e, Event::Read(PMIC_ADDR, PMIC_PWRGOOD, _))).count();
+        assert!(polls < 65, "too many PG reads: {polls}");
+        assert!(delay.total_ns < 200_000_000);
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+    }
+    run_test!(polling_deadline_counts_i2c_time, polling_deadline_counts_i2c_time_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn retained_power_recovery_never_rearms_body() {
+        let mut original = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        original.initialize().await.unwrap();
+        original.configure_clock_gate().await.unwrap();
+        original.enable().await.unwrap();
+        let (mut i2c, _) = original.release();
+        i2c.events.clear();
+        let mut recovered = Inkplate5v2Power::new(i2c, FakeDelay::default());
+        recovered.recover_retained_power().await.unwrap();
+        assert_eq!(recovered.state(), PowerState::Faulted);
+        let next = recovered.enable().await;
+        assert_eq!(next, Err(PowerError::InvalidState(PowerState::Faulted)));
+        let (i2c, _) = recovered.release();
+        assert_eq!(i2c.pcal[PCAL_OUTPUT0 as usize] & ALL_CONTROL, 0);
+        assert_eq!(i2c.pcal[PCAL_OUTPUT1 as usize] & GPIO0_ENABLE, 0);
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(PMIC_ADDR, PMIC_UPSEQ0 | PMIC_DWNSEQ0, _))));
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, values)
+                if values[0] & (OE | VCOM | PWRUP) == (OE | VCOM | PWRUP))));
+    }
+    run_test!(retained_power_recovery_never_rearms, retained_power_recovery_never_rearms_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn retained_power_recovery_rejects_unknown_directions_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        let result = power.recover_retained_power().await;
+        assert_eq!(result, Err(PowerError::LowVoltageReadbackMismatch));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert!(!i2c.events.iter().any(|e| matches!(e, Event::Write(..))));
+    }
+    run_test!(retained_power_recovery_rejects_unknown_directions,
+        retained_power_recovery_rejects_unknown_directions_body);
 
 }

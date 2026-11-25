@@ -33,12 +33,12 @@
 
 use embedded_hal::digital::OutputPin;
 #[cfg(feature = "blocking")]
-use embedded_hal::{delay::DelayNs, i2c::I2c};
+use embedded_hal::i2c::I2c;
 #[cfg(not(feature = "blocking"))]
-use embedded_hal_async::{delay::DelayNs, i2c::I2c};
+use embedded_hal_async::i2c::I2c;
 
 use epdpi::EpdParallelBus;
-use crate::inkplate5v2_power::{ExpanderSnapshot, Inkplate5v2Power, PowerError, PowerState};
+use crate::inkplate5v2_power::{ExpanderSnapshot, Inkplate5v2Power, PowerDelay, PowerError, PowerState};
 use crate::inkplate5v2_timing::{self as timing, Inkplate5v2Signals};
 
 /// Bytes in one ED052TC4 row including Soldered's trailing clock bytes.
@@ -299,7 +299,7 @@ struct Signals<'a, I2C, DELAY, P> {
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin> Inkplate5v2Signals
+impl<I2C: I2c, DELAY: PowerDelay, P: Inkplate5v2ControlPin> Inkplate5v2Signals
     for Signals<'_, I2C, DELAY, P>
 {
     type Error = Inkplate5v2BusError<I2C::Error, P::Error, ()>;
@@ -340,7 +340,7 @@ impl<I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin> Inkplate5v2Signals
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
+impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: PowerDelay, P: Inkplate5v2ControlPin>
     Inkplate5v2Bus<TX, I2C, DELAY, P>
 {
     /// Low-voltage preparation, **not** a read-only diagnostic.
@@ -606,7 +606,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
     sync(feature = "blocking", keep_self),
     async(not(feature = "blocking"), keep_self)
 )]
-impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: DelayNs, P: Inkplate5v2ControlPin>
+impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: PowerDelay, P: Inkplate5v2ControlPin>
     EpdParallelBus for Inkplate5v2Bus<TX, I2C, DELAY, P>
 {
     type Error = Inkplate5v2BusError<I2C::Error, P::Error, TX::Error>;
@@ -808,14 +808,23 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "blocking")]
+    use embedded_hal::delay::DelayNs;
+    #[cfg(not(feature = "blocking"))]
+    use embedded_hal_async::delay::DelayNs;
+
     #[derive(Default)]
-    struct FakeDelay;
+    struct FakeDelay(u64);
+
+    impl PowerDelay for FakeDelay {
+        fn now_us(&self) -> u64 { self.0 / 1000 }
+    }
     #[maybe_async_cfg::maybe(
         sync(feature = "blocking", keep_self),
         async(not(feature = "blocking"), keep_self)
     )]
     impl DelayNs for FakeDelay {
-        async fn delay_ns(&mut self, _: u32) {}
+        async fn delay_ns(&mut self, ns: u32) { self.0 += u64::from(ns); }
     }
 
     #[derive(Default)]
@@ -916,7 +925,7 @@ mod tests {
     fn bus_with_i2c(i2c: FakeI2c) -> Inkplate5v2Bus<FakeTx, FakeI2c, FakeDelay, FakePin> {
         Inkplate5v2Bus::new(
             FakeTx::default(),
-            Inkplate5v2Power::new(i2c, FakeDelay),
+            Inkplate5v2Power::new(i2c, FakeDelay::default()),
             Inkplate5v2DirectPins {
                 le: FakePin::default(),
                 ckv: FakePin::default(),

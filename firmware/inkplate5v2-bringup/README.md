@@ -21,8 +21,8 @@ link any display library and should remain the safest first firmware test.
 In all these firmware modes, **panel HV is never requested**:
 `Inkplate5v2Bus::set_power(true)` still rejects requests with
 `HardwareNotValidated`. I2S DMA is constructed only in the opt-in mode;
-it sends no display rows. The opt-in build **does** modify hardware pins and
-PMIC configuration, so it is not a substitute for read-only diagnostics.
+it sends no display rows. The opt-in builds **do** modify hardware pins and wake the PMIC, but do not
+write its register configuration. They are not substitutes for read-only diagnostics.
 
 The UART is the board's CH340C serial bridge. A 5-second snapshot shows
 PCAL input/output levels and configurations, including P0.7 PGOOD and
@@ -47,9 +47,9 @@ Only after the read-only and single-cycle tests succeed, build and flash
 with the verified backup/recovery procedure (adjust the serial port):
 
 ```sh
-cargo +esp build --release --features low-voltage-cycles \\
+cargo +esp build --release --features low-voltage-cycles \
   --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
-espflash flash --chip esp32 --port /dev/ttyUSB0 --monitor \\
+espflash flash --chip esp32 --port /dev/ttyUSB0 --monitor \
   target/xtensa-esp32-none-elf/release/inkplate5v2-bringup
 ```
 

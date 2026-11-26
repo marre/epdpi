@@ -122,3 +122,9 @@ stall remains a blocker for scanning. No HV activation is authorized by
 this record; the existing interlock remains in place.
 
 Follow-up source review selected the panel-specific E4/1E sequence instead of the vendor E4/1B override, and added a logic-supply settling dwell. The earlier E4/1B diagnostic result is retained as historical evidence, not the current expected programmed order. No energized operation has been tested. See the PMIC hardening notes.
+
+2026-11-26 historical review restores the previously tested vendor E4/1B
+baseline provisionally and corrects direct/expander signal ordering before
+logic supply. Low-voltage SPH is now low. New physical tests are pending;
+the earlier 100-cycle result applies to the previous SPH-high preparation.
+See PMIC hardening notes for issue #297 and outstanding analogue constraints.

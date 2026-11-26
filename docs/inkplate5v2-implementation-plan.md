@@ -43,8 +43,7 @@ The [fourth independent review](inkplate5v2-fourth-pass-contracts.md) examined A
 Recovery and all planned standby tests have passed on the actual board; see
 [hardware validation](inkplate5v2-hardware-validation.md). The detailed
 [PMIC hardening notes](inkplate5v2-pmic-hardening.md) document the new
-panel-specific E4/1E ordering and logic supply settling dwell. Earlier
-E4/1B results are historical. The panel's actual VGL decay timing and
+provisional vendor E4/1B ordering (restored after historical review) and logic supply settling dwell. The earlier E4/1B standby result is relevant; the interim E4/1E order is superseded. The panel's actual VGL decay timing and
 rail/logic relationships remain unverified without instrumentation.
 Do not automatically advance to an energized test solely on the basis
 of serial readback. The public HV interlock remains intact.

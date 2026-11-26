@@ -47,7 +47,8 @@ pub async fn idle_before_power<S: Inkplate5v2Signals>(
     pins: &mut S,
 ) -> Result<(), S::Error> {
     pins.set_le(false).await?;
-    pins.set_sph(true).await?;
+    // All direct inputs low until the logic supply is enabled.
+    pins.set_sph(false).await?;
     pins.set_ckv(false).await?;
     Ok(())
 }
@@ -201,7 +202,7 @@ mod tests {
         row_end(&mut fake).await.unwrap();
         frame_end(&mut fake).await;
         assert_eq!(fake.events, vec![
-            Event::Le(false), Event::Sph(true), Event::Ckv(false),
+            Event::Le(false), Event::Sph(false), Event::Ckv(false),
             Event::Ckv(true), Event::Wait(7), Event::Spv(false),
             Event::Wait(10), Event::Ckv(false), Event::Ckv(true),
             Event::Wait(8), Event::Spv(true), Event::Wait(10),

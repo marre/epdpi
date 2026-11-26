@@ -378,7 +378,7 @@ impl<TX: Inkplate5v2Dma, I2C: I2c, DELAY: PowerDelay, P: Inkplate5v2ControlPin>
         self.pads_release_pending = true;
         self.pins.le.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
         self.pins.ckv.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
-        self.pins.sph.arm_output(true).map_err(Inkplate5v2BusError::Gpio)?;
+        self.pins.sph.arm_output(false).map_err(Inkplate5v2BusError::Gpio)?;
         {
             let mut s = Signals { power: &mut self.power, pins: &mut self.pins };
             timing::idle_before_power(&mut s).await.map_err(|e| match e {
@@ -938,6 +938,17 @@ mod tests {
         bus_with_i2c(FakeI2c::fresh())
     }
 
+    // Test-only active path; the production set_power(true) interlock is intact.
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn enable_simulated(b: &mut Inkplate5v2Bus<FakeTx, FakeI2c, FakeDelay, FakePin>) {
+        b.power.enable_logic_supply().await.unwrap();
+        b.pins.sph.set_high().unwrap();
+        b.power.enable_after_logic().await.unwrap();
+    }
+
     macro_rules! run_both {
         ($name:ident, $body:ident) => {
             #[test]
@@ -1012,7 +1023,7 @@ mod tests {
         let (i2c, _) = power.release();
         assert_eq!(tx.transmissions, 0);
         assert_eq!(pins.ckv.writes, &[false]);
-        assert_eq!(pins.sph.writes, &[true]);
+        assert_eq!(pins.sph.writes, &[false]);
         assert_eq!(pins.le.writes, &[false]);
         assert!(!i2c.writes.iter().any(|&(addr, reg, value)|
             addr == 0x48 && reg == 0x01 && value == 0x20
@@ -1070,7 +1081,7 @@ mod tests {
             }
             // Exercise the existing crate-private power controller to simulate
             // a fully powered state. The public HV interlock stays locked.
-            b.power.enable().await.unwrap();
+            enable_simulated(&mut b).await;
             assert_eq!(b.power.state(), PowerState::On);
             b.set_power(false).await.unwrap();
             assert_eq!(b.power.state(), PowerState::Idle);
@@ -1122,7 +1133,7 @@ mod tests {
         b.prepare_low_voltage().await.unwrap();
         // Simulation-only: internal PMIC may be powered for tests, public
         // set_power(true) remains permanently hardware-locked.
-        b.power.enable().await.unwrap();
+        enable_simulated(&mut b).await;
         b.start_frame().await.unwrap();
         for _ in 0..INKPLATE5V2_ROWS {
             b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await.unwrap();
@@ -1161,7 +1172,7 @@ mod tests {
         let physical = fake.physical_pgood.clone();
         let mut b = bus_with_i2c(fake);
         b.prepare_low_voltage().await.unwrap();
-        b.power.enable().await.unwrap();
+        enable_simulated(&mut b).await;
         physical.set(Some(false));
         let result = b.start_frame().await;
         assert!(matches!(
@@ -1188,7 +1199,7 @@ mod tests {
     async fn short_frame_fails_closed_without_declaring_success_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        b.power.enable().await.unwrap(); // test-only, public HV interlock unchanged
+        enable_simulated(&mut b).await; // test-only, public HV interlock unchanged
         b.start_frame().await.unwrap();
         let result = b.end_frame().await;
         assert!(matches!(
@@ -1213,7 +1224,7 @@ mod tests {
     async fn extra_row_is_rejected_before_dma_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        b.power.enable().await.unwrap(); // test-only
+        enable_simulated(&mut b).await; // test-only
         b.start_frame().await.unwrap();
         for _ in 0..INKPLATE5V2_ROWS {
             b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await.unwrap();
@@ -1239,7 +1250,7 @@ mod tests {
     async fn exact_row_count_survives_multiple_complete_frames_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        b.power.enable().await.unwrap(); // test-only
+        enable_simulated(&mut b).await; // test-only
         for _ in 0..2 {
             b.start_frame().await.unwrap();
             for _ in 0..INKPLATE5V2_ROWS {
@@ -1269,7 +1280,7 @@ mod tests {
     async fn dma_failure_releases_all_panel_pins_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        b.power.enable().await.unwrap(); // test only
+        enable_simulated(&mut b).await; // test only
         b.start_frame().await.unwrap();
         b.tx.fail_send = true;
         let failed = b.write_scanline(&[0; INKPLATE5V2_ROW_BYTES]).await;
@@ -1293,7 +1304,7 @@ mod tests {
     async fn quiesce_failure_does_not_skip_power_or_high_z_body() {
         let mut b = bus();
         b.prepare_low_voltage().await.unwrap();
-        b.power.enable().await.unwrap();
+        enable_simulated(&mut b).await;
         b.tx.fail_quiesce = true;
         let off = b.set_power(false).await;
         assert!(matches!(off, Err(Inkplate5v2BusError::Dma(BusFault))));
@@ -1321,7 +1332,7 @@ mod tests {
             let physical = i2c.physical_pgood.clone();
             let mut b = bus_with_i2c(i2c);
             b.prepare_low_voltage().await.unwrap();
-            b.power.enable().await.unwrap();
+            enable_simulated(&mut b).await;
             b.tx.trace = Some(trace.clone());
             b.pins.le.trace = Some(trace.clone());
             b.pins.ckv.trace = Some(trace.clone());

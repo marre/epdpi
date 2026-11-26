@@ -76,7 +76,7 @@ display pins, the clock gate stays off and no I2S is instantiated.
 The factory snapshot is read again after sleep and must match the
 initial snapshot exactly. Use the same flash procedure as above, replacing
 the feature with `pmic-standby-check`. Expected output includes
-`Volatile sequencer verified: UP=E4/55 DOWN=1E/E0` on the tested unit (the earlier 1B test is historical),
+`Volatile sequencer verified: UP=E4/55 DOWN=1B/E0` on the tested unit,
 then the original factory `UP=E4/55 DOWN=1E/E0` and a PASS line.
 Do not enable or attempt a powered refresh based on this test.
 
@@ -85,7 +85,7 @@ Do not enable or attempt a powered refresh based on this test.
 - Chip: classic ESP32, not ESP32-S3.
 - I2C0: SDA GPIO21, SCL GPIO22.
 - Direct panel controls: LE GPIO2 (low), CKV GPIO32 (low),
-  SPH GPIO33 (high).
+  SPH GPIO33 (low until logic supply is enabled in a future powered mode).
 - I2S1 source clock: GPIO0; eight data pins in board order:
   GPIO4, 5, 18, 19, 23, 25, 26, 27.
 - DMA capacity: 336 bytes per row (320 source data + 16 padding clocks).

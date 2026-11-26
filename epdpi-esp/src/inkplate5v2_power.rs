@@ -926,10 +926,12 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         // ED052TC4 §7 requires VDD before the source/gate supplies.
         // This guard is relative to the enable readback, not a VDD measurement.
         self.delay.delay_ms(1).await;
-        Ok(())
+        // Establish the digital boundary before allowing the caller to
+        // raise even a direct idle signal.
+        self.verify_logic_ready().await
     }
 
-    async fn enable_sequence(&mut self) -> Result<(), PowerError<I2C::Error>> {
+    async fn verify_logic_ready(&mut self) -> Result<(), PowerError<I2C::Error>> {
         // Recheck the logic-only state before allowing panel signals high.
         let snapshot = self.inspect_expander().await?;
         if snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN
@@ -948,6 +950,11 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         if enable != V3P3_ENABLE {
             return Err(PowerError::EnableReadbackMismatch(enable));
         }
+        Ok(())
+    }
+
+    async fn enable_sequence(&mut self) -> Result<(), PowerError<I2C::Error>> {
+        self.verify_logic_ready().await?;
         self.expander_levels(GMOD | SPV, GMOD | SPV).await?;
         let started = self.delay.now_us();
         self.expander_levels(PWRUP, PWRUP).await?;
@@ -980,10 +987,11 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
                     if !self.before_deadline(started, STARTUP_TIMEOUT_MS) {
                         return Err(PowerError::PowerGoodTimeout(last));
                     }
-                    if self.read(PMIC_ADDR, PMIC_PWRGOOD).await? != PGOOD_ALL_RAILS
+                    let settled_pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+                    if settled_pg != PGOOD_ALL_RAILS
                         || !self.before_deadline(started, STARTUP_TIMEOUT_MS)
                     {
-                        return Err(PowerError::PowerGoodTimeout(last));
+                        return Err(PowerError::PowerGoodTimeout(settled_pg));
                     }
                     self.expander_levels(VCOM, VCOM).await?;
                     // Allow VCOM_CTRL deglitch (TI pin specification).
@@ -999,9 +1007,18 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
                         || bias.output_port0 & ALL_CONTROL != expected | VCOM
                         || bias.direction_port0 & ALL_CONTROL != 0
                         || !bias.pgood_pin_high()
-                        || self.read(PMIC_ADDR, PMIC_PWRGOOD).await? != PGOOD_ALL_RAILS
                     {
+                        // Read actual PG first so a lost rail is not hidden
+                        // behind the aggregate physical pin dropping.
+                        let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+                        if pg != PGOOD_ALL_RAILS {
+                            return Err(PowerError::PowerGoodLost(pg));
+                        }
                         return Err(PowerError::PanelControlLost);
+                    }
+                    let pg = self.read(PMIC_ADDR, PMIC_PWRGOOD).await?;
+                    if pg != PGOOD_ALL_RAILS {
+                        return Err(PowerError::PowerGoodLost(pg));
                     }
                     self.verify_no_pmic_fault().await?;
                     self.expander_levels(OE, OE).await?;
@@ -2010,8 +2027,8 @@ mod tests {
         async(not(feature = "blocking"), keep_self)
     )]
     async fn every_power_up_write_failure_shuts_off_controls_and_latches_body() {
-        // There are eight distinct register writes from the beginning of
-        // enable_sequence() through the OE assertion. Fail each one in
+        // There are nine distinct register writes from logic preparation
+        // through the OE assertion. Fail each one in
         // isolation, then require the compensating shutdown to run.
         for offset in 1..=9 {
             let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());

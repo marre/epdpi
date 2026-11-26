@@ -1,10 +1,12 @@
 # TPS65186 power-state hardening
 
+For the detailed cross-project comparison, commit history, reported failures and power-mode trade-offs, see [PMIC research and upstream failure history](inkplate5v2-pmic-research.md).
+
 Source: [TI TPS65186 SLVSB04A](https://www.ti.com/lit/ds/symlink/tps65186.pdf), Fig. 2, §§8.3.5–6, 8.4 and 8.6.2, 8.6.10–13. Vendor: [TPS65186.cpp](https://github.com/SolderedElectronics/Inkplate-Arduino-library/blob/master/src/features/TPS65186/TPS65186.cpp).
 
 - Wait 5 ms after WAKEUP before I2C (TI minimum 1.8 ms).
 - Check actual expander input levels as well as latches before wake, especially PWRUP. Initial standby inspection does not write PMIC registers.
-- Sleep reloads factory defaults. Configure and read back the four sequencing registers on each actual power-up, retaining the factory-loaded delay bytes rather than forcing shorter delays. Superseded by the ED052TC4-specific order E4/1E below; earlier tests exercised the vendor E4/1B pair.
+- Sleep reloads factory defaults. Configure and read back the four sequencing registers on each actual power-up, retaining the factory-loaded delay bytes rather than forcing shorter delays. The current provisional order is E4/1B, restored after the historical review below; the intermediate E4/1E choice is superseded.
 - Check PCAL input inversion and input latch registers before using pin readings (NXP PCAL6416A Rev. 7.1 §§7.4.3, 7.4.6); read physical Port 1 clock gate as well as its direction and latch. Check ENABLE status at each new frame, not only at startup.
 - Ordinary and emergency bus shutdown share one path. Disable OE/GMOD before changing direct GPIOs and latch the bus before awaiting shutdown. I2S clock/data pads now remain exclusively owned by the board-specific transport, which can reset their GPIO matrix routing and drive them low before shutdown, then remove drive and pulls afterward. OE/GMOD/SPV are released only if the PMIC off status is verified; PMIC controls stay low.
 - Confirm ENABLE state and physical controls before and after enabling VCOM, then enable OE. ENABLE and PG are status indicators, not voltage measurements.

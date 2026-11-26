@@ -40,6 +40,8 @@ The [fourth independent review](inkplate5v2-fourth-pass-contracts.md) examined A
 
 ## Electrical sequencing review (2026-11-25)
 
+The [PMIC research and upstream failure history](inkplate5v2-pmic-research.md) records the cross-project comparison and evidence behind the current provisional baseline.
+
 Recovery and all planned standby tests have passed on the actual board; see
 [hardware validation](inkplate5v2-hardware-validation.md). The detailed
 [PMIC hardening notes](inkplate5v2-pmic-hardening.md) document the new

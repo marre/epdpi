@@ -17,6 +17,7 @@ default = []
 low-voltage-prep = []
 low-voltage-cycles = ["low-voltage-prep"]
 pmic-standby-check = []
+pmic-logic-check = []
 
 [dependencies]
 epdpi-esp = { path = "../../epdpi-esp", default-features = false, features = ["blocking", "esp32"] }

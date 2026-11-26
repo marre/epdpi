@@ -761,7 +761,7 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
             return Err(PowerError::ClockNotEnabled);
         }
         self.state = PowerState::Faulted;
-        let result = self.enable_logic_inner().await;
+        let result = self.enable_logic_inner(true).await;
         if let Err(error) = &result {
             self.capture_partial_power(error).await;
             let _ = self.shutdown_sequence().await;
@@ -828,6 +828,48 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
             }
         }
         Ok([UP_SEQUENCE, up_delay, DOWN_SEQUENCE, down_delay])
+    }
+
+    /// One bounded logic-supply-only diagnostic, with no direct panel GPIO
+    /// configuration and the clock gate forced off. Never asserts PWRUP,
+    /// VCOM or OE. Returns the verified logic-ready expander snapshot only
+    /// after shutdown, factory reload and release have succeeded.
+    /// Requires exclusive board ownership and a clean boot.
+    pub async fn check_logic_supply(&mut self) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
+        self.boot_preflight().await?;
+        self.initialize().await?;
+        let baseline = self.idle_snapshot.ok_or(PowerError::FactorySnapshotChanged)?;
+        self.state = PowerState::Faulted;
+        let result = self.logic_supply_check_inner(baseline).await;
+        if let Err(error) = &result {
+            self.state = PowerState::Faulted;
+            self.capture_partial_power(error).await;
+            let _ = self.shutdown_sequence().await;
+            let _ = self.disable_clock_gate().await;
+        }
+        result
+    }
+
+    async fn logic_supply_check_inner(
+        &mut self, baseline: PmicSnapshot,
+    ) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
+        self.disable_clock_gate().await?;
+        self.enable_logic_inner(false).await?;
+        self.state = PowerState::LogicReady;
+        // Short bounded dwell, then a fresh verification. Never leave logic
+        // enabled while printing diagnostics or waiting for a command.
+        self.delay.delay_ms(10).await;
+        let snapshot = self.verify_logic_ready(false).await?;
+        self.verify_no_pmic_fault().await?;
+        self.disable().await?;
+        self.state = PowerState::Faulted;
+        self.inspect_standby_and_sleep().await?;
+        if self.idle_snapshot != Some(baseline) {
+            return Err(PowerError::FactorySnapshotChanged);
+        }
+        self.state = PowerState::Idle;
+        self.release_panel_controls().await?;
+        Ok(snapshot)
     }
 
     /// Single standby-only sequencer check. No panel HV, VCOM, OE, clock
@@ -904,7 +946,7 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         Ok(())
     }
 
-    async fn enable_logic_inner(&mut self) -> Result<(), PowerError<I2C::Error>> {
+    async fn enable_logic_inner(&mut self, clock_required: bool) -> Result<(), PowerError<I2C::Error>> {
         // Original 5V2 driver and upstream 2024 correction: supply first.
         self.expander_levels(OE | GMOD | SPV | VCOM | PWRUP, 0).await?;
         self.expander_levels(WAKEUP, WAKEUP).await?;
@@ -928,17 +970,22 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         self.delay.delay_ms(1).await;
         // Establish the digital boundary before allowing the caller to
         // raise even a direct idle signal.
-        self.verify_logic_ready().await
+        self.verify_logic_ready(clock_required).await.map(|_| ())
     }
 
-    async fn verify_logic_ready(&mut self) -> Result<(), PowerError<I2C::Error>> {
+    async fn verify_logic_ready(&mut self, clock_required: bool) -> Result<ExpanderSnapshot, PowerError<I2C::Error>> {
         // Recheck the logic-only state before allowing panel signals high.
         let snapshot = self.inspect_expander().await?;
         if snapshot.direction_port0 & (ALL_CONTROL | PWR_GOOD_PIN) != PWR_GOOD_PIN
             || snapshot.input_port0 & ALL_CONTROL != WAKEUP
             || snapshot.output_port0 & ALL_CONTROL != WAKEUP
             || snapshot.pgood_pin_high()
-            || !snapshot.clock_enabled()
+            || if clock_required {
+                !snapshot.clock_enabled()
+            } else {
+                (snapshot.input_port1 | snapshot.output_port1 | snapshot.direction_port1)
+                    & GPIO0_ENABLE != 0
+            }
         {
             return Err(PowerError::PanelControlLost);
         }
@@ -950,11 +997,11 @@ impl<I2C: I2c, DELAY: PowerDelay> Inkplate5v2Power<I2C, DELAY> {
         if enable != V3P3_ENABLE {
             return Err(PowerError::EnableReadbackMismatch(enable));
         }
-        Ok(())
+        Ok(snapshot)
     }
 
     async fn enable_sequence(&mut self) -> Result<(), PowerError<I2C::Error>> {
-        self.verify_logic_ready().await?;
+        self.verify_logic_ready(true).await?;
         self.expander_levels(GMOD | SPV, GMOD | SPV).await?;
         let started = self.delay.now_us();
         self.expander_levels(PWRUP, PWRUP).await?;
@@ -2616,5 +2663,63 @@ mod tests {
             Event::Write(PMIC_ADDR, PMIC_ENABLE, _))));
     }
     run_test!(partial_power_during_shutdown_is_not_idle, partial_power_during_shutdown_is_not_idle_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn logic_only_check_releases_without_hv_body() {
+        let mut power = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        let ready = power.check_logic_supply().await.unwrap();
+        assert_eq!(ready.input_port0 & ALL_CONTROL, WAKEUP);
+        assert!(!ready.pgood_pin_high());
+        assert!(!ready.clock_enabled());
+        assert_eq!(power.state(), PowerState::Idle);
+        let final_snapshot = power.inspect_expander().await.unwrap();
+        assert_eq!(final_snapshot.direction_port0 & ALL_CONTROL, PANEL_CONTROL);
+        assert!(!final_snapshot.clock_enabled());
+        let (i2c, _) = power.release();
+        let writes: Vec<_> = i2c.events.iter().filter_map(|event| match event {
+            Event::Write(PMIC_ADDR, PMIC_ENABLE, values) => Some(values[0]),
+            _ => None,
+        }).collect();
+        assert_eq!(writes, [V3P3_ENABLE, 0]);
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, values)
+                if values[0] & (PWRUP | VCOM | OE | GMOD | SPV) != 0)));
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT1, values)
+                if values[0] & GPIO0_ENABLE != 0)));
+    }
+    run_test!(logic_only_check_releases_without_hv, logic_only_check_releases_without_hv_body);
+
+    #[maybe_async_cfg::maybe(
+        sync(feature = "blocking", keep_self),
+        async(not(feature = "blocking"), keep_self)
+    )]
+    async fn logic_only_check_contains_ambiguous_enable_write_body() {
+        // Determine the write index from a successful trace, so adding a
+        // preflight transaction cannot silently change the injected fault.
+        let mut good = Inkplate5v2Power::new(FakeI2c::new(), FakeDelay::default());
+        good.check_logic_supply().await.unwrap();
+        let (i2c, _) = good.release();
+        let write_index = i2c.events.iter().filter(|event| matches!(event, Event::Write(..)))
+            .position(|event| matches!(event,
+                Event::Write(PMIC_ADDR, PMIC_ENABLE, v) if v[0] == V3P3_ENABLE))
+            .unwrap() + 1;
+        let mut fake = FakeI2c::new();
+        fake.fail_after_write_attempt = Some(write_index);
+        let mut power = Inkplate5v2Power::new(fake, FakeDelay::default());
+        assert_eq!(power.check_logic_supply().await, Err(PowerError::I2c(FakeError)));
+        assert_eq!(power.state(), PowerState::Faulted);
+        let (i2c, _) = power.release();
+        assert_eq!(i2c.physical_controls(), 0);
+        assert_eq!(i2c.pmic[PMIC_ENABLE as usize], 0);
+        assert!(!i2c.events.iter().any(|event| matches!(event,
+            Event::Write(EXPANDER_ADDR, PCAL_OUTPUT0, v)
+                if v[0] & (PWRUP | VCOM | OE | GMOD | SPV) != 0)));
+    }
+    run_test!(logic_only_check_contains_ambiguous_enable_write,
+        logic_only_check_contains_ambiguous_enable_write_body);
 
 }

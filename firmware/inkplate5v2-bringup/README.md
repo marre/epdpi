@@ -24,7 +24,8 @@ In all these firmware modes, **panel HV is never requested**:
 `HardwareNotValidated`. I2S DMA is constructed only in the opt-in mode;
 it sends no display rows. The opt-in builds **do** modify hardware pins and wake the PMIC, but do not
 write its register configuration in the low-voltage modes. The PMIC standby
-check explicitly writes only volatile sequencer registers. These are not
+check explicitly writes only volatile sequencer registers. The logic-only
+check additionally enables and disables the logic supply (ENABLE=20/00). These are not
 substitutes for read-only diagnostics.
 
 The UART is the board's CH340C serial bridge. A 5-second snapshot shows
@@ -79,6 +80,18 @@ the feature with `pmic-standby-check`. Expected output includes
 `Volatile sequencer verified: UP=E4/55 DOWN=1B/E0` on the tested unit,
 then the original factory `UP=E4/55 DOWN=1E/E0` and a PASS line.
 Do not enable or attempt a powered refresh based on this test.
+
+## PMIC logic supply check
+
+After the successful standby diagnostic, select `pmic-logic-check`
+instead of `pmic-standby-check`. It performs one cycle per boot with
+ENABLE=20, verifies PG=00 and inactive PWRUP/VCOM/OE/GMOD/SPV, holds
+the logic-only state for 10 ms, then uses the normal verified shutdown
+and factory reload. No direct GPIO or I2S is configured; the clock gate
+remains off. Diagnostics are printed only after shutdown on success.
+Expected captured logic-ready INPUT0=08, OUTPUT0=C8, DIR0=C0, gate off.
+Final snapshots should match the earlier released state. Any failure halts;
+do not repeatedly reset on error. This verifies digital readback only.
 
 ## Design notes
 

@@ -26,11 +26,15 @@ use esp_hal::{
 
 #[cfg(feature = "low-voltage-prep")]
 use epdpi_esp::inkplate5v2_bus::{Inkplate5v2Bus, Inkplate5v2DirectPins, Inkplate5v2Tx};
-#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
+#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check", feature = "pmic-logic-check"))]
 use epdpi_esp::inkplate5v2_power::PmicSnapshot;
 
-#[cfg(all(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
-compile_error!("Select either low-voltage preparation or the PMIC-only standby check.");
+#[cfg(any(
+    all(feature = "low-voltage-prep", feature = "pmic-standby-check"),
+    all(feature = "low-voltage-prep", feature = "pmic-logic-check"),
+    all(feature = "pmic-standby-check", feature = "pmic-logic-check"),
+))]
+compile_error!("Select exactly one bring-up mode.");
 
 #[cfg(feature = "low-voltage-prep")]
 use esp_hal::{
@@ -58,7 +62,7 @@ fn log_snapshot(snapshot: ExpanderSnapshot) {
     esp_println::println!("PGOOD is a logic reading, NOT a physical rail-voltage measurement.");
 }
 
-#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
+#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check", feature = "pmic-logic-check"))]
 fn halt() -> ! {
     loop { core::hint::spin_loop(); }
 }
@@ -77,7 +81,7 @@ fn check_transition(initial: ExpanderSnapshot, actual: ExpanderSnapshot, release
         && actual.input_port1 & 1 == u8::from(!released)
 }
 
-#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check"))]
+#[cfg(any(feature = "low-voltage-prep", feature = "pmic-standby-check", feature = "pmic-logic-check"))]
 fn log_pmic(snapshot: PmicSnapshot) {
     esp_println::println!(
         "TPS65186 standby: REVID=0x{:02X} ENABLE=0x{:02X} PG=0x{:02X} VADJ=0x{:02X}",
@@ -123,7 +127,7 @@ fn main() -> ! {
 
     // Default build: create NO display output pins, I2S, or PMIC writes.
     // The read-only first-stage diagnostic remains independently buildable.
-    #[cfg(not(any(feature = "low-voltage-prep", feature = "pmic-standby-check")))]
+    #[cfg(not(any(feature = "low-voltage-prep", feature = "pmic-standby-check", feature = "pmic-logic-check")))]
     {
         esp_println::println!("Mode: READ ONLY (no PCAL output/configuration register writes)");
         let mut power = power;
@@ -149,6 +153,36 @@ fn main() -> ! {
             }
             Err(error) => {
                 esp_println::println!("PMIC standby check failed: {error:?}. Halted; no automatic retry.");
+                halt();
+            }
+        }
+        loop {
+            match power.inspect_expander() {
+                Ok(snapshot) => log_snapshot(snapshot),
+                Err(error) => {
+                    esp_println::println!("Post-check inspection failed: {error:?}. Halted.");
+                    halt();
+                }
+            }
+            wait_for_next_snapshot();
+        }
+    }
+
+    // Logic only: no direct GPIO, clock gate or I2S setup.
+    #[cfg(feature = "pmic-logic-check")]
+    {
+        let mut power = power;
+        esp_println::println!("Mode: PMIC LOGIC SUPPLY CHECK; HV LOCKED");
+        let started = Instant::now();
+        match power.check_logic_supply() {
+            Ok(ready) => {
+                esp_println::println!("Logic-ready verified: ENABLE=0x20 PG=0x00; captured before shutdown");
+                log_snapshot(ready);
+                if let Some(snapshot) = power.idle_pmic_snapshot() { log_pmic(snapshot); }
+                esp_println::println!("PASS: logic-only cycle and factory reload; HV never requested; elapsed={} us", started.elapsed().as_micros());
+            }
+            Err(error) => {
+                esp_println::println!("Logic-only check failed: {error:?}; fault evidence: {:?}. Halted; no retry.", power.pmic_fault_snapshot());
                 halt();
             }
         }

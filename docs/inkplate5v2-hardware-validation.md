@@ -128,3 +128,7 @@ baseline provisionally and corrects direct/expander signal ordering before
 logic supply. Low-voltage SPH is now low. New physical tests are pending;
 the earlier 100-cycle result applies to the previous SPH-high preparation.
 See PMIC hardening notes for issue #297 and outstanding analogue constraints.
+
+Next physical gate: `pmic-logic-check` (not yet tested). One cycle per boot,
+clock gate off, no direct GPIO/I2S, ENABLE=20 only, PG=00, shutdown and
+factory snapshot verification. The public HV interlock remains unchanged.

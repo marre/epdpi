@@ -52,6 +52,9 @@ jobs:
       - name: Check PMIC-only standby sequencer diagnostic
         working-directory: firmware/inkplate5v2-bringup
         run: cargo build --release --features pmic-standby-check --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+      - name: Check PMIC logic-only diagnostic
+        working-directory: firmware/inkplate5v2-bringup
+        run: cargo build --release --features pmic-logic-check --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
       - name: Check ordinary read-only image still builds
         working-directory: firmware/inkplate5v2-diagnostic
         run: cargo build --release --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
